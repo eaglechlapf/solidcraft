@@ -17,6 +17,7 @@ use solidcraft_engine::doc::{IDENTITY, Mat};
 use crate::SolveApp;
 use crate::dialogs_assembly::{Asm, Hover, picked_snap, placement_of_body, snap_of};
 use crate::selection::SelInput;
+use crate::ui_kit::BackingTooltipExt as _;
 use crate::ui_kit::{Container, StatusTone, Surface, expr_row, status_line};
 use crate::viewport::Proj;
 
@@ -76,10 +77,13 @@ pub struct MateForm {
     pub angle: String,
     pub flip: bool,
     pub lock: bool,
-    /// The gap between two flat faces slides between `min` and `max` instead.
+    /// The gap between two flat faces slides between `min` and `max` instead (or the angle
+    /// between `min_angle` and `max_angle`).
     pub limits: bool,
     pub min: String,
     pub max: String,
+    pub min_angle: String,
+    pub max_angle: String,
     pub error: Option<String>,
     pub hover: Hover,
     pub applied: Option<Applied>,
@@ -94,7 +98,15 @@ pub struct MateForm {
 }
 
 fn start_form() -> MateForm {
-    MateForm { distance: "0 mm".into(), angle: "90 deg".into(), min: "0 mm".into(), max: "10 mm".into(), ..Default::default() }
+    MateForm {
+        distance: "0 mm".into(),
+        angle: "90 deg".into(),
+        min: "0 mm".into(),
+        max: "10 mm".into(),
+        min_angle: "0 deg".into(),
+        max_angle: "90 deg".into(),
+        ..Default::default()
+    }
 }
 
 /// What a Mate pick takes: a face, an edge or a corner as itself (an edge is not its middle and
@@ -154,13 +166,16 @@ fn pick_param(app: &SolveApp, sel: &Sel) -> Option<Value> {
     Some(v)
 }
 
-/// Whether the gap can take limits: two flat faces mated.
+/// Whether the gap or the angle can take limits: two flat faces mated, or at an angle.
 fn limitable(f: &MateForm) -> bool {
-    f.mode == Mode::Auto
-        && f.applied.as_ref().is_some_and(|a| {
-            let rule = a.reply["rule"].as_str().unwrap_or_default();
-            matches!(rule, "mate" | "flush") || (a.params.get("limits").is_some() && a.reply["kind"] == "parallel")
-        })
+    f.applied.as_ref().is_some_and(|a| {
+        let rule = a.reply["rule"].as_str().unwrap_or_default();
+        match f.mode {
+            Mode::Auto => matches!(rule, "mate" | "flush") || (a.params.get("limits").is_some() && a.reply["kind"] == "parallel"),
+            Mode::Angle => rule == "angle",
+            _ => false,
+        }
+    })
 }
 
 /// `assembly.mate`'s parameters for `picks` with the form's values.
@@ -172,7 +187,9 @@ fn params(app: &SolveApp, f: &MateForm, picks: &[Sel; 2]) -> Result<Value, Strin
     if f.mode != Mode::Auto {
         p["mode"] = json!(f.mode.name());
     }
-    if f.mode == Mode::Angle {
+    if f.mode == Mode::Angle && f.limits && limitable(f) {
+        p["limits"] = json!([f.min_angle.trim(), f.max_angle.trim()]);
+    } else if f.mode == Mode::Angle {
         p["angle"] = json!(f.angle.trim());
     } else if f.limits && limitable(f) {
         p["limits"] = json!([f.min.trim(), f.max.trim()]);
@@ -444,13 +461,15 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, f: &mut MateForm, inputs: &mu
         status_line(ui, solidcraft_ui_text::tr(h), StatusTone::Dim);
     }
     if limitable(f) {
-        let before = (f.limits, f.min.clone(), f.max.clone());
+        let angular = f.mode == Mode::Angle;
+        let before = (f.limits, f.min.clone(), f.max.clone(), f.min_angle.clone(), f.max_angle.clone());
         crate::ui_kit::options(ui, "mate_options", &mut [(solidcraft_ui_text::tr("mate.limits"), &mut f.limits)]);
         if f.limits {
-            expr_row(ui, solidcraft_ui_text::tr("mate.min"), &mut f.min);
-            expr_row(ui, solidcraft_ui_text::tr("mate.max"), &mut f.max);
+            let (min, max) = if angular { (&mut f.min_angle, &mut f.max_angle) } else { (&mut f.min, &mut f.max) };
+            expr_row(ui, solidcraft_ui_text::tr("mate.min"), min);
+            expr_row(ui, solidcraft_ui_text::tr("mate.max"), max);
         }
-        if before != (f.limits, f.min.clone(), f.max.clone()) {
+        if before != (f.limits, f.min.clone(), f.max.clone(), f.min_angle.clone(), f.max_angle.clone()) {
             f.changed = true;
         }
     }
@@ -515,6 +534,18 @@ fn rule_label(rule: &str) -> &'static str {
 }
 
 /// A toggle in the pill; true when clicked.
+/// A switch of the pill as an icon, its name on hover (and to screen readers).
+fn icon_toggle(ui: &mut egui::Ui, icon: &str, label: &str, on: bool, handle: &str) -> bool {
+    let t = solidcraft_theme::Tokens::get();
+    let side = t.control_height;
+    let r = ui.add(egui::Button::new("").selected(on).min_size(egui::vec2(side, side)).sense(egui::Sense::CLICK));
+    crate::icons::paint_icon(ui.painter(), r.rect.shrink(t.space_3), icon, f32::from(t.icon.a()) / 255.0);
+    r.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, label));
+    t.button_bevel(ui, &r, on);
+    crate::scenario::publish_handle(handle, r.rect.center());
+    r.backing_on_hover_text(label).clicked()
+}
+
 fn toggle(ui: &mut egui::Ui, label: &str, on: bool, handle: &str) -> bool {
     let r = crate::ui_kit::button(ui, label, if on { crate::ui_kit::Button::SmallSelected } else { crate::ui_kit::Button::Small });
     crate::scenario::publish_handle(handle, r.rect.center());
@@ -546,7 +577,7 @@ pub fn overlay(app: &SolveApp, painter: &egui::Painter, proj: &Proj, f: &mut Mat
                 if valued && !(f.limits && limitable(f)) {
                     let value = if f.mode == Mode::Angle { &mut f.angle } else { &mut f.distance };
                     let id = egui::Id::unique("sc_mate_value");
-                    let r = crate::ui_kit::canvas_value_field(ui, id, value, false);
+                    let r = crate::ui_kit::canvas_value_field(ui, id, value, false, "");
                     crate::scenario::publish_handle("mate:value", r.rect.center());
                     if f.focus {
                         f.focus = false;
@@ -565,32 +596,34 @@ pub fn overlay(app: &SolveApp, painter: &egui::Painter, proj: &Proj, f: &mut Mat
                     }
                 }
                 if planes || rule == "angle" {
-                    if toggle(ui, solidcraft_ui_text::tr("mate.angle"), f.mode == Mode::Angle, "mate:angle") {
+                    if icon_toggle(ui, "constraint_angle", solidcraft_ui_text::tr("mate.angle"), f.mode == Mode::Angle, "mate:angle") {
                         f.mode = if f.mode == Mode::Angle { Mode::Auto } else { Mode::Angle };
                         f.changed = true;
                         f.focus = true;
                     }
-                    if toggle(ui, solidcraft_ui_text::tr("mate.flip"), f.flip, "mate:flip") {
+                    if icon_toggle(ui, "reverse_normal", solidcraft_ui_text::tr("mate.flip"), f.flip, "mate:flip") {
                         f.flip = !f.flip;
                         f.changed = true;
                     }
                 }
                 // Two cylinders, or a straight edge and a cylinder: on one axis or side by side.
                 let axial = matches!(rule.as_str(), "concentric") && (faces || f.mode == Mode::Axial);
-                if axial && toggle(ui, solidcraft_ui_text::tr("mate.tangent"), false, "mate:tangent") {
+                if axial && icon_toggle(ui, "constraint_tangent", solidcraft_ui_text::tr("mate.tangent"), false, "mate:tangent") {
                     f.mode = if faces { Mode::Tangent } else { Mode::Auto };
                     f.changed = true;
                     f.focus = true;
                 }
-                if kind == "line_on_cylinder" && toggle(ui, solidcraft_ui_text::tr("mate.axial"), false, "mate:axial") {
+                if kind == "line_on_cylinder" && icon_toggle(ui, "constraint_concentric", solidcraft_ui_text::tr("mate.axial"), false, "mate:axial") {
                     f.mode = if faces { Mode::Auto } else { Mode::Axial };
                     f.changed = true;
                 }
-                if matches!(rule.as_str(), "concentric" | "insert") && toggle(ui, solidcraft_ui_text::tr("mate.lock"), f.lock, "mate:lock") {
+                if matches!(rule.as_str(), "concentric" | "insert")
+                    && icon_toggle(ui, "c_fix", solidcraft_ui_text::tr("mate.lock"), f.lock, "mate:lock")
+                {
                     f.lock = !f.lock;
                     f.changed = true;
                 }
-                if rule == "insert" && toggle(ui, solidcraft_ui_text::tr("mate.flip"), f.flip, "mate:flip") {
+                if rule == "insert" && icon_toggle(ui, "reverse_normal", solidcraft_ui_text::tr("mate.flip"), f.flip, "mate:flip") {
                     f.flip = !f.flip;
                     f.changed = true;
                 }
@@ -627,6 +660,18 @@ pub fn show_references(app: &mut SolveApp, body: &str) -> bool {
     true
 }
 
+/// Esc in the Mate tool with a mate shown: it is taken back (on the next frame, `step`), and the
+/// tool stays open. False when there is no mate to take back: Esc closes the tool.
+pub fn take_back(d: &mut crate::dialogs::Dialog) -> bool {
+    match &mut d.kind {
+        crate::dialogs::Kind::Assembly(Asm::Mate(f)) if f.applied.is_some() && f.slide.is_none() => {
+            f.undo = true;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// The Mate tool is open.
 pub fn open(app: &SolveApp) -> bool {
     app.dialog.as_ref().is_some_and(|d| matches!(&d.kind, crate::dialogs::Kind::Assembly(Asm::Mate(_))))
@@ -635,6 +680,37 @@ pub fn open(app: &SolveApp) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Esc with a mate shown takes it back and keeps the tool open for the next; the next Esc
+    /// closes the tool. Neither leaves an undo step behind.
+    #[test]
+    fn esc_takes_the_mate_back_then_closes_the_tool() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.preferences.animate_mates = false;
+        crate::test_support::grounded_boxes(&[("A", 0), ("B", 30)], |id, p| h.app.run(id, p).unwrap());
+        let undo = h.app.session.undo.len();
+        h.app.start("assembly.mate");
+        let (b, a) = (
+            crate::dialogs::face_sel(&h.app.session, Vec3::new(40.0, 10.0, 10.0)).unwrap(),
+            crate::dialogs::face_sel(&h.app.session, Vec3::new(10.0, 10.0, 10.0)).unwrap(),
+        );
+        if let Some(d) = h.app.dialog.as_mut() {
+            d.inputs[0].items = vec![b];
+            d.inputs[1].items = vec![a];
+        }
+        h.frames(3);
+        assert_eq!(h.app.session.doc.assembly.joints.len(), 1, "the mate is made");
+        h.step(&json!({"key": "Escape"})).unwrap();
+        h.frames(2);
+        assert!(h.app.session.doc.assembly.joints.is_empty(), "Esc takes it back");
+        assert!(open(&h.app), "and the tool stays open");
+        assert_eq!(h.app.session.undo.len(), undo, "nothing left to undo");
+        h.step(&json!({"key": "Escape"})).unwrap();
+        h.frames(1);
+        assert!(!open(&h.app), "the next Esc closes the tool");
+        assert_eq!(h.app.session.undo.len(), undo);
+    }
 
     /// Each frame of the slide is a placement `occurrence.move` takes, and puts the part there.
     #[test]

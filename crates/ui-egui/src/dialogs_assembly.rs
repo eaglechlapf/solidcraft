@@ -4358,7 +4358,8 @@ pub fn joint_glyphs(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
     let pointer = ctx
         .input(|i| if i.pointer.any_down() { None } else { i.pointer.hover_pos() })
         .filter(|p| painter.clip_rect().contains(*p) && !crate::shell::covered(app, *p));
-    if let Some(p) = pointer
+    // The Mate tool's pill names the mate it just made, where its glyph sits: no tooltip over it.
+    if let Some(p) = pointer.filter(|_| !crate::dialogs_mate::open(app))
         && let Some(id) = joint_glyph_at(&plan, p)
         && let Some(tip) = joint_glyph_tip(app, id)
     {

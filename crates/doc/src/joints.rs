@@ -585,6 +585,10 @@ pub enum JointKind {
     /// B's origin stays `offset` from A's z axis: a point on a cylinder's wall. B turns round A's
     /// axis, slides along it and turns any way about its origin.
     PointOnCylinder,
+    /// B's z stays within the joint's limits of tilt (`angle`, from mated, about their common x);
+    /// B moves freely and turns about either z: an angle between two faces that may swing
+    /// between a least and a most.
+    AngleRange,
 }
 
 impl JointKind {
@@ -605,6 +609,7 @@ impl JointKind {
             "lineonplane" | "lineonface" => JointKind::LineOnPlane,
             "lineoncylinder" => JointKind::LineOnCylinder,
             "pointoncylinder" => JointKind::PointOnCylinder,
+            "anglerange" => JointKind::AngleRange,
             _ => return None,
         })
     }
@@ -625,6 +630,7 @@ impl JointKind {
             JointKind::LineOnPlane => &["x", "y", "turn", "spin"],
             JointKind::LineOnCylinder => &["turn", "slide", "spin"],
             JointKind::PointOnCylinder => &["turn", "slide", "yaw", "pitch", "roll"],
+            JointKind::AngleRange => &["x", "y", "z", "turn", "angle", "spin"],
         }
     }
     pub fn is_angle(self, i: usize) -> bool {
@@ -644,6 +650,7 @@ impl JointKind {
                 | JointKind::LineOnPlane
                 | JointKind::LineOnCylinder
                 | JointKind::PointOnCylinder
+                | JointKind::AngleRange
         )
     }
 }
@@ -1427,7 +1434,7 @@ pub fn motion(kind: JointKind, q: &[f64]) -> Mat {
         JointKind::Planar => mat_mul(&shift(v(0), v(1), 0.0), &rot_z(v(2))),
         JointKind::Ball => mat_mul(&mat_mul(&rot_z(v(0)), &rot_y(v(1))), &rot_z(v(2))),
         JointKind::Parallel => mat_mul(&shift(v(0), v(1), v(2)), &rot_z(v(3))),
-        JointKind::Perpendicular | JointKind::Angle => mat_mul(&shift(v(0), v(1), v(2)), &rot_z(v(3))),
+        JointKind::Perpendicular | JointKind::Angle | JointKind::AngleRange => mat_mul(&shift(v(0), v(1), v(2)), &rot_z(v(3))),
         // Their turn is about B's origin, after the offset (`tail`).
         JointKind::PointOnPlane => shift(v(0), v(1), 0.0),
         JointKind::PointOnLine => shift(0.0, 0.0, v(0)),
@@ -1450,6 +1457,7 @@ fn tail(j: &Joint, q: &[f64]) -> Mat {
     match j.kind {
         JointKind::Perpendicular => mat_mul(&rot_x(std::f64::consts::FRAC_PI_2), &rot_z(v(4))),
         JointKind::Angle => mat_mul(&rot_x(j.angle), &rot_z(v(4))),
+        JointKind::AngleRange => mat_mul(&rot_x(v(4)), &rot_z(v(5))),
         JointKind::LineOnPlane => mat_mul(&rot_y(std::f64::consts::FRAC_PI_2), &rot_z(v(3))),
         JointKind::PointOnPlane => turn_zyx(v(2), v(3), v(4)),
         JointKind::PointOnLine => turn_zyx(v(1), v(2), v(3)),
@@ -1957,7 +1965,7 @@ pub fn joint_values(asm: &Assembly) -> BTreeMap<u64, Vec<f64>> {
 /// side of the datum - and `flip` asks for the mated relation.
 pub fn flip_of(j: &Joint) -> Mat {
     // An angle relation's `angle` is its tilt (`tail`); a perpendicular one has none.
-    let turn = if matches!(j.kind, JointKind::Angle | JointKind::Perpendicular) { 0.0 } else { j.angle };
+    let turn = if matches!(j.kind, JointKind::Angle | JointKind::Perpendicular | JointKind::AngleRange) { 0.0 } else { j.angle };
     let mut m = rot_z(turn);
     // On a cylinder the offset is the distance from A's axis, laid along x; else it is along z.
     if matches!(j.kind, JointKind::LineOnCylinder | JointKind::PointOnCylinder) {
@@ -4038,6 +4046,7 @@ mod tests {
                 JointKind::LineOnPlane,
                 JointKind::LineOnCylinder,
                 JointKind::PointOnCylinder,
+                JointKind::AngleRange,
             ] {
                 joint.kind = kind;
                 joint.offset = 2.7;

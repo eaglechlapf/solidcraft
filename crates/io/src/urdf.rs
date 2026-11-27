@@ -290,7 +290,8 @@ fn steps(kind: JointKind) -> Option<Vec<(Step, Vec3, usize)>> {
         | JointKind::PointOnLine
         | JointKind::LineOnPlane
         | JointKind::LineOnCylinder
-        | JointKind::PointOnCylinder => return None,
+        | JointKind::PointOnCylinder
+        | JointKind::AngleRange => return None,
     })
 }
 

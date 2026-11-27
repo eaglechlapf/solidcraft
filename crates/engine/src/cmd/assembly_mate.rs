@@ -36,7 +36,7 @@ pub static COMMANDS: &[CommandSpec] = &[CommandSpec::new("assembly.mate", "Mate"
          straight edge rests on a cylinder; angle: two flat faces at `angle`; tangent: two cylinders side by side; axial: a \
          straight edge on a cylinder's axis); offset?: the gap (mm or an expression); angle?: deg (for angle); flip?: turn \
          the moving part over (two faces flush instead of against each other); lock?: true stops the turn of two parts on one \
-         axis; limits?: [min, max] of the gap (mm) instead of one gap: the part slides between them; name?; quiet? → \
+         axis; limits?: [min, max] of the gap (mm) instead of one gap, or with mode angle of the angle (deg) instead of `angle`: the part moves between them; name?; quiet? → \
          joint, name, rule, kind, fell_back, dof, conflicts, fixed",
     )];
 
@@ -98,11 +98,14 @@ fn mate(s: &mut Session, p: &Value) -> Result<Value> {
         None => 0.0,
     };
     let angle = p.get("angle").map(|v| value(s, v, true, cmd)).transpose()?;
+    let mode = str_(p, "mode").unwrap_or("auto");
+    // An angle's limits are angles (degrees), a gap's lengths.
+    let angular = mode == "angle";
     let limits = match p.get("limits") {
         None | Some(Value::Null) => None,
         Some(Value::Array(pair)) if pair.len() == 2 => {
-            let lo = pair.first().map(|v| value(s, v, false, cmd)).transpose()?.unwrap_or(0.0);
-            let hi = pair.get(1).map(|v| value(s, v, false, cmd)).transpose()?.unwrap_or(0.0);
+            let lo = pair.first().map(|v| value(s, v, angular, cmd)).transpose()?.unwrap_or(0.0);
+            let hi = pair.get(1).map(|v| value(s, v, angular, cmd)).transpose()?.unwrap_or(0.0);
             if lo > hi {
                 return Err(bad(cmd, "`limits` must be [min, max] with min no larger than max"));
             }
@@ -110,25 +113,25 @@ fn mate(s: &mut Session, p: &Value) -> Result<Value> {
         }
         Some(_) => return Err(bad(cmd, "`limits` must be [min, max]")),
     };
-    let mode = str_(p, "mode").unwrap_or("auto");
     if !matches!(mode, "auto" | "angle" | "tangent" | "axial") {
         return Err(bad(cmd, "`mode` must be auto, angle, tangent or axial"));
     }
     let flip = bool_(p, "flip") == Some(true);
     let lock = bool_(p, "lock") == Some(true);
     let tries = rules(&moving, &target, mode, flip, lock, cmd)?;
-    if mode == "angle" && angle.is_none() {
+    if mode == "angle" && angle.is_none() && limits.is_none() {
         return Err(bad(cmd, "the angle mode needs `angle`"));
     }
-    if limits.is_some() && !tries.first().is_some_and(|t| matches!(t.kind, JointKind::Planar)) {
-        return Err(bad(cmd, "limits are taken for the gap between two flat faces"));
+    if limits.is_some() && !tries.first().is_some_and(|t| matches!(t.kind, JointKind::Planar | JointKind::Angle)) {
+        return Err(bad(cmd, "limits are taken for the gap or the angle between two flat faces"));
     }
-    // A gap between limits is a parallel joint's free distance, held between them.
+    // A gap between limits is a parallel joint's free distance, held between them; an angle
+    // between limits, an angle range's tilt.
     let mut tries = tries;
     if limits.is_some()
         && let Some(t) = tries.first_mut()
     {
-        t.kind = JointKind::Parallel;
+        t.kind = if t.kind == JointKind::Angle { JointKind::AngleRange } else { JointKind::Parallel };
     }
     let saved = s.doc.clone();
     let last = tries.len().saturating_sub(1);
@@ -183,6 +186,12 @@ fn attempt(s: &mut Session, p: &Value, t: &Try, gap: f64, angle: Option<f64>, li
     let signed = if t.inward { -gap } else { gap };
     match t.kind {
         JointKind::Angle => j.angle = angle.unwrap_or(0.0),
+        JointKind::AngleRange => {
+            j.angle = 0.0;
+            if let Some((lo, hi)) = limits {
+                j.limits = vec![None, None, None, None, Some((lo, hi)), None];
+            }
+        }
         // A gap that slides between limits: the parallel joint's z, not a fixed offset.
         JointKind::Parallel if parallel_gap => {
             j.offset = 0.0;
@@ -213,6 +222,28 @@ fn attempt(s: &mut Session, p: &Value, t: &Try, gap: f64, angle: Option<f64>, li
         && let Some(z) = j.values.get_mut(2)
     {
         *z = z.clamp(lo, hi);
+    }
+    if let Some((lo, hi)) = limits.filter(|_| t.kind == JointKind::AngleRange)
+        && let Some(tilt) = j.values.get_mut(4)
+    {
+        // A turn is the same a whole turn on: the one nearest the range (a half turn is as much
+        // +180 as -180 degrees), then into it.
+        let off = |a: f64| {
+            if a < lo {
+                lo - a
+            } else if a > hi {
+                a - hi
+            } else {
+                0.0
+            }
+        };
+        let tau = std::f64::consts::TAU;
+        let near = [*tilt - tau, *tilt, *tilt + tau].into_iter().min_by(|a, b| off(*a).total_cmp(&off(*b))).unwrap_or(*tilt);
+        *tilt = near.clamp(lo, hi);
+        // Kept as found: `add_joint` would find them again and clamp the half turn the other way.
+        if let Some(m) = q.as_object_mut() {
+            m.insert("values".into(), json!(j.values));
+        }
     }
     add_joint(s, j, &q)
 }

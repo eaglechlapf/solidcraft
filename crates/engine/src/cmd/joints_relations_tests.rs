@@ -1203,6 +1203,31 @@ fn mate_lines_up_two_cylinders_or_rests_them_side_by_side() {
     assert!(d.x.abs() < 1e-6 && d.y.abs() < 1e-6, "{d:?}");
 }
 
+/// An angle between two flat faces may take limits instead of one angle: the part swings
+/// between them, and starts at the nearest (here the most, from a side standing square).
+#[test]
+fn mate_with_angle_limits_lets_the_faces_swing_between_them() {
+    let mut s = plate_and_free_block();
+    let side = json!({"occurrence": "Block", "face": [30, 45, 60]});
+    let top = json!({"occurrence": "Plate", "face": [5, 5, 10]});
+    let r = mate(&mut s, side.clone(), top.clone(), json!({"mode": "angle", "limits": ["10 deg", "30 deg"]}));
+    assert!(clean(&r), "{r}");
+    assert_eq!((r["rule"].as_str(), r["kind"].as_str()), (Some("angle"), Some("angle_range")), "{r}");
+    // The side's outward normal (-x on the block) is 30 degrees off mated: 150 from the top's.
+    let n = place(&s, "Block", Vec3::new(29.0, 45.0, 60.0)) - place(&s, "Block", Vec3::new(30.0, 45.0, 60.0));
+    assert!((n.dot(Vec3::Z) - 150f64.to_radians().cos()).abs() < 1e-6, "{n:?}");
+    // A face turned right away from the other (a half turn off mated) starts at the most.
+    let mut s = plate_and_free_block();
+    let block_top = json!({"occurrence": "Block", "face": [31, 41, 70]});
+    let r = mate(&mut s, block_top, top.clone(), json!({"mode": "angle", "limits": ["0 deg", "90 deg"]}));
+    assert!(clean(&r), "{r}");
+    let n = place(&s, "Block", Vec3::new(31.0, 41.0, 71.0)) - place(&s, "Block", Vec3::new(31.0, 41.0, 70.0));
+    assert!(n.dot(Vec3::Z).abs() < 1e-6, "90 degrees off mated: the top stands square to the plate's: {n:?}");
+    let p = json!({"a": side, "b": top, "mode": "angle", "limits": ["30 deg", "10 deg"]});
+    let e = s.execute("assembly.mate", &p).expect_err("min above max").to_string();
+    assert!(e.contains("min no larger than max"), "{e}");
+}
+
 /// A pin's end rim past its rounded edge has no cylinder beside it: it still sits on a hole's rim,
 /// centre on centre, the pin standing on the plate (its end out of it, against the hole's end).
 #[test]

@@ -3401,7 +3401,10 @@ fn shortcuts_focused(app: &mut SolveApp, ctx: &egui::Context) {
                 if cancel_unfinished(app) {
                     continue;
                 }
-                if app.dialog.is_some() || app.pending_feature_edit.is_some() {
+                // The Mate tool's Esc takes back the mate it shows; the next Esc closes it.
+                if app.dialog.as_mut().is_some_and(crate::dialogs_mate::take_back) {
+                    app.last_escape = None;
+                } else if app.dialog.is_some() || app.pending_feature_edit.is_some() {
                     crate::dialogs::cancel(app);
                 } else if crate::viewport_status::enabled(app) && crate::viewport_status::escape(app, repeat) {
                     app.last_escape = None;

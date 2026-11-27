@@ -610,6 +610,7 @@ pub(crate) fn script_steps(doc: &Document, has_body: &dyn Fn(&str) -> bool, own:
             solidcraft_doc::joints::JointKind::LineOnPlane => "line_on_plane",
             solidcraft_doc::joints::JointKind::LineOnCylinder => "line_on_cylinder",
             solidcraft_doc::joints::JointKind::PointOnCylinder => "point_on_cylinder",
+            solidcraft_doc::joints::JointKind::AngleRange => "angle_range",
         };
         let a = joint_origin_arg(&j.a, doc)?;
         let b = joint_origin_arg(&j.b, doc)?;

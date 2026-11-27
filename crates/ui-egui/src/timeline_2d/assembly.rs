@@ -122,6 +122,9 @@ pub fn format_joint_tooltip(joint: &VisualJoint, is_active: bool) -> String {
         JointKind::PointOnPlane => "Point On Plane",
         JointKind::PointOnLine => "Point On Line",
         JointKind::LineOnPlane => "Line On Plane",
+        JointKind::LineOnCylinder => "Line On Cylinder",
+        JointKind::PointOnCylinder => "Point On Cylinder",
+        JointKind::AngleRange => "Angle Range",
     };
 
     let status = if joint.suppressed {

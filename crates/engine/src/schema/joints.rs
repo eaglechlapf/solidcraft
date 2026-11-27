@@ -279,7 +279,7 @@ impl JsonSchema for OccurrenceKey {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct JointTypeParam(pub JointKind);
 
-const TYPE_MESSAGE: &str = "`type` must be rigid, revolute, slider, cylindrical, pin_slot, planar, ball, parallel, perpendicular, angle, point_on_plane, point_on_line, line_on_plane, line_on_cylinder or point_on_cylinder";
+const TYPE_MESSAGE: &str = "`type` must be rigid, revolute, slider, cylindrical, pin_slot, planar, ball, parallel, perpendicular, angle, point_on_plane, point_on_line, line_on_plane, line_on_cylinder, point_on_cylinder or angle_range";
 
 /// The spellings `JointKind::parse` takes, canonical ones first.
 const JOINT_TYPES: &[&str] = &[
@@ -298,6 +298,7 @@ const JOINT_TYPES: &[&str] = &[
     "line_on_plane",
     "line_on_cylinder",
     "point_on_cylinder",
+    "angle_range",
     "rotate",
     "slide",
     "square",
@@ -318,7 +319,7 @@ impl JsonSchema for JointTypeParam {
     }
     fn json_schema(_: &mut SchemaGenerator) -> Schema {
         json_schema!({
-            "description": "A joint's type: rigid, revolute (turns), slider (slides), cylindrical (both), pin_slot, planar or ball; or a relation that ties only some directions or points, made where the parts are: parallel, perpendicular, angle, point_on_plane, point_on_line, line_on_plane, line_on_cylinder or point_on_cylinder. Case, spaces, `_` and `-` are ignored, and rotate, slide, square, point_on_face, point_on_axis and line_on_face are also taken.",
+            "description": "A joint's type: rigid, revolute (turns), slider (slides), cylindrical (both), pin_slot, planar or ball; or a relation that ties only some directions or points, made where the parts are: parallel, perpendicular, angle, point_on_plane, point_on_line, line_on_plane, line_on_cylinder, point_on_cylinder or angle_range (an angle between limits). Case, spaces, `_` and `-` are ignored, and rotate, slide, square, point_on_face, point_on_axis and line_on_face are also taken.",
             "type": "string",
             "examples": JOINT_TYPES
         })
@@ -882,8 +883,9 @@ pub struct MateParams {
     /// Stop two parts on one axis turning about it. Default: false.
     #[serde(default)]
     pub lock: Option<bool>,
-    /// The lowest and highest gap between two flat faces, instead of one gap: the part slides
-    /// between them. Default: none.
+    /// The lowest and highest gap between two flat faces, instead of one gap, or with mode
+    /// `angle` the lowest and highest angle (degrees), instead of `angle`: the part moves between
+    /// them. Default: none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "MateLimits")]
     pub limits: Option<MateLimits>,

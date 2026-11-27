@@ -5533,7 +5533,11 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                         apply_again = false;
                     }
                     crate::ui_kit::Action::Cancel => {
-                        if (!app.esc_handled && escape_routed_here) || !ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        let by_esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+                        // Esc in the Mate tool takes back the mate it shows first (as below).
+                        if by_esc && !app.esc_handled && escape_routed_here && crate::dialogs_mate::take_back(&mut d) {
+                            app.esc_handled = true;
+                        } else if (!app.esc_handled && escape_routed_here) || !by_esc {
                             cancel = true;
                         }
                     }
@@ -5644,7 +5648,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     }
     if !preset_prompt && !report_active && esc && !app.esc_handled && escape_routed_here {
         app.esc_handled = true;
-        cancel = true;
+        // The Mate tool's Esc takes back the mate it shows; the next Esc closes it.
+        if !crate::dialogs_mate::take_back(&mut d) {
+            cancel = true;
+        }
     }
     // A plane picked for a new sketch starts it right away.
     let mut then_start = None;
