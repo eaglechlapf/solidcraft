@@ -540,7 +540,7 @@ fn representative(h: &Harness, command: &str) -> Dialog {
             } else {
                 vec![Sel::Body { name: name.into() }]
             }
-        } else if input.accept == crate::dialogs_assembly::SNAPS {
+        } else if input.accept == crate::dialogs_assembly::SNAPS || input.accept == crate::dialogs_mate::PICKS {
             // A joint origin takes datums too now (PLANES, AXES), but a joint's two sides must
             // sit on different components: face snaps keep each side on its own component.
             vec![face_sel(s, point).unwrap()]

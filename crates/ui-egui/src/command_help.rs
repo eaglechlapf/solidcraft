@@ -16,6 +16,7 @@ pub const DOCUMENTED: &[&str] = &[
     "appearance.assign",
     "assembly.bom",
     "assembly.constraint.create",
+    "assembly.mate",
     "canvas.decal",
     "canvas.edit",
     "canvas.insert",

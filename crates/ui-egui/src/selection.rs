@@ -222,7 +222,8 @@ impl SelInput {
     /// exactly the joint-origin kinds: one that takes more besides them (Measure's items take
     /// sketch curves too) handles them itself.
     pub fn rejects(&self, sel: &Sel) -> bool {
-        self.accept == crate::dialogs_assembly::SNAPS && matches!(sel, Sel::SketchCurve { .. } | Sel::ExternalSketchCurve { .. })
+        (self.accept == crate::dialogs_assembly::SNAPS || self.accept == crate::dialogs_mate::PICKS)
+            && matches!(sel, Sel::SketchCurve { .. } | Sel::ExternalSketchCurve { .. })
     }
 
     /// The selection a hit stands for, if this input accepts it. A curve of another sketch than

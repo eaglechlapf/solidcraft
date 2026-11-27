@@ -1096,3 +1096,167 @@ fn concentric_and_flush_on_fasteners_in_large_loop_group_do_not_jump_to_six_dof(
         assert_eq!(dof_of(&list, &s, "Fastener15"), Some(want_both), "fixed={fixed_plate_a}: {list}");
     }
 }
+
+// assembly.mate: one command joins two picks the way they suggest; the first pick's part moves.
+
+fn mate(s: &mut Session, a: Value, b: Value, extra: Value) -> Value {
+    let mut p = json!({"a": a, "b": b});
+    if let (Some(p), Some(extra)) = (p.as_object_mut(), extra.as_object()) {
+        p.extend(extra.clone());
+    }
+    run(s, "assembly.mate", p)
+}
+
+/// A plate (100 x 100 x 10, grounded) and a 20 mm block above it at (30, 40, 50).
+fn plate_and_free_block() -> Session {
+    let mut s = Session::default();
+    run(&mut s, "component.create", json!({"name": "Plate"}));
+    run(&mut s, "solid.box", json!({"length": 100, "width": 100, "height": 10, "corner": [0, 0, 0]}));
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    run(&mut s, "component.create", json!({"name": "Block"}));
+    run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 20, "corner": [30, 40, 50]}));
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    let plate = occ(&s, "Plate");
+    run(&mut s, "occurrence.ground", json!({"occurrence": plate, "grounded": true}));
+    s
+}
+
+/// Two flat faces mate, the first pick's part moving onto the second; a gap and limits hold it off
+/// the face, and a second mate that disagrees with the first falls back to parallel.
+#[test]
+fn mate_joins_two_flat_faces_and_falls_back_to_parallel() {
+    let mut s = plate_and_free_block();
+    let block_bottom = json!({"occurrence": "Block", "face": [31, 41, 50]});
+    let plate_top = json!({"occurrence": "Plate", "face": [5, 5, 10]});
+    let r = mate(&mut s, block_bottom.clone(), plate_top.clone(), json!({}));
+    assert!(clean(&r), "{r}");
+    assert_eq!((r["rule"].as_str(), r["kind"].as_str(), r["fell_back"].as_bool()), (Some("mate"), Some("planar"), Some(false)), "{r}");
+    assert_eq!(dof_of(&r, &s, "Block"), Some(3), "{r}");
+    assert!(near_z(block_z(&s), (10.0, 30.0)), "{:?}", block_z(&s));
+    // The same faces 5 mm apart disagree with the first mate: parallel instead, where it is. (The
+    // block's bottom is on the plate now.)
+    let block_bottom = json!({"occurrence": "Block", "face": [31, 41, 10]});
+    let r = mate(&mut s, block_bottom, plate_top.clone(), json!({"offset": 5}));
+    assert_eq!((r["rule"].as_str(), r["fell_back"].as_bool()), (Some("parallel"), Some(true)), "{r}");
+    assert!(clean(&r), "{r}");
+    assert!(near_z(block_z(&s), (10.0, 30.0)), "{:?}", block_z(&s));
+}
+
+/// A gap between limits: the block slides off the plate between them, and starts at the nearer one.
+#[test]
+fn mate_with_limits_lets_the_gap_slide_between_them() {
+    let mut s = plate_and_free_block();
+    let r = mate(
+        &mut s,
+        json!({"occurrence": "Block", "face": [31, 41, 50]}),
+        json!({"occurrence": "Plate", "face": [5, 5, 10]}),
+        json!({"limits": [5, 20]}),
+    );
+    assert!(clean(&r), "{r}");
+    assert_eq!(r["kind"], "parallel", "{r}");
+    assert_eq!(dof_of(&r, &s, "Block"), Some(4), "{r}");
+    // It was 40 mm off: it comes to the nearer limit.
+    assert!(near_z(block_z(&s), (30.0, 50.0)), "{:?}", block_z(&s));
+    let p = json!({"a": {"occurrence": "Block", "face": [31, 41, 50]}, "b": {"occurrence": "Plate", "face": [5, 5, 10]}, "limits": [20, 5]});
+    let e = s.execute("assembly.mate", &p).expect_err("min above max").to_string();
+    assert!(e.contains("min no larger than max"), "{e}");
+}
+
+/// Two cylinders line up on one axis (turning and sliding, or sliding only when locked), or rest
+/// side by side in the tangent mode.
+#[test]
+fn mate_lines_up_two_cylinders_or_rests_them_side_by_side() {
+    let make = || {
+        let mut s = Session::default();
+        run(&mut s, "component.create", json!({"name": "Shaft"}));
+        run(&mut s, "solid.cylinder", json!({"base": [0, 0, 0], "axis": [0, 0, 1], "radius": 5, "height": 40, "operation": "new"}));
+        run(&mut s, "component.activate", json!({"component": "root"}));
+        run(&mut s, "component.create", json!({"name": "Roller"}));
+        run(&mut s, "solid.cylinder", json!({"base": [60, 30, 10], "axis": [0, 1, 0], "radius": 8, "height": 20, "operation": "new"}));
+        run(&mut s, "component.activate", json!({"component": "root"}));
+        let shaft = occ(&s, "Shaft");
+        run(&mut s, "occurrence.ground", json!({"occurrence": shaft, "grounded": true}));
+        s
+    };
+    let roller = json!({"occurrence": "Roller", "face": [68, 40, 10]});
+    let shaft = json!({"occurrence": "Shaft", "face": [5, 0, 20]});
+    let mut s = make();
+    let r = mate(&mut s, roller.clone(), shaft.clone(), json!({}));
+    assert!(clean(&r), "{r}");
+    assert_eq!((r["rule"].as_str(), r["kind"].as_str()), (Some("concentric"), Some("cylindrical")), "{r}");
+    assert_eq!(dof_of(&r, &s, "Roller"), Some(2), "{r}");
+    // Its axis on the shaft's: a point on it lands on x = y = 0.
+    let c = place(&s, "Roller", Vec3::new(60.0, 40.0, 10.0));
+    assert!(c.x.hypot(c.y) < 1e-6, "{c:?}");
+    let mut s = make();
+    let r = mate(&mut s, roller.clone(), shaft.clone(), json!({"lock": true}));
+    assert_eq!((r["kind"].as_str(), dof_of(&r, &s, "Roller")), (Some("slider"), Some(1)), "{r}");
+    let mut s = make();
+    let r = mate(&mut s, roller.clone(), shaft.clone(), json!({"mode": "tangent"}));
+    assert!(clean(&r), "{r}");
+    assert_eq!(r["kind"], "line_on_cylinder", "{r}");
+    assert_eq!(dof_of(&r, &s, "Roller"), Some(3), "{r}");
+    // Its axis 13 mm (5 + 8) from the shaft's, and along it.
+    let c = place(&s, "Roller", Vec3::new(60.0, 40.0, 10.0));
+    let d = place(&s, "Roller", Vec3::new(60.0, 30.0, 10.0)) - c;
+    assert!((c.x.hypot(c.y) - 13.0).abs() < 1e-6, "{c:?}");
+    assert!(d.x.abs() < 1e-6 && d.y.abs() < 1e-6, "{d:?}");
+}
+
+/// A pin's end rim past its rounded edge has no cylinder beside it: it still sits on a hole's rim,
+/// centre on centre, the pin standing on the plate (its end out of it, against the hole's end).
+#[test]
+fn mate_sits_a_rounded_pin_on_a_hole() {
+    let mut s = plate_and_free_block();
+    let plate = occ(&s, "Plate");
+    run(&mut s, "component.activate", json!({"component": "Plate"}));
+    run(&mut s, "solid.cylinder", json!({"base": [70, 70, 0], "axis": [0, 0, 1], "radius": 6, "height": 10, "operation": "cut"}));
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    run(&mut s, "component.create", json!({"name": "Pin"}));
+    run(&mut s, "solid.cylinder", json!({"base": [20, 20, 40], "axis": [0, 0, 1], "radius": 6, "height": 30, "operation": "new"}));
+    run(&mut s, "solid.fillet", json!({"edges": [[26, 20, 40]], "radius": 2}));
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    let pin = occ(&s, "Pin");
+    let r = mate(&mut s, json!({"occurrence": pin, "edge": [24, 20, 40]}), json!({"occurrence": plate, "edge": [76, 70, 10]}), json!({}));
+    assert!(clean(&r), "{r}");
+    assert_eq!((r["rule"].as_str(), r["kind"].as_str()), (Some("insert"), Some("revolute")), "{r}");
+    let end = place(&s, "Pin", Vec3::new(20.0, 20.0, 40.0));
+    let top = place(&s, "Pin", Vec3::new(20.0, 20.0, 70.0));
+    assert!(end.dist(Vec3::new(70.0, 70.0, 10.0)) < 1e-6 && top.dist(Vec3::new(70.0, 70.0, 40.0)) < 1e-6, "{end:?} {top:?}");
+}
+
+/// A part already mated face to face lines its hole up with a hole in the plate below, whichever
+/// rims the picks were nearer: an axis has no side, so the part keeps facing the way it does
+/// rather than turning over against its first mate (and falling back to a parallel that is
+/// upside down too).
+#[test]
+fn mate_lines_up_two_holes_of_parts_already_face_to_face() {
+    let make = || {
+        let mut s = plate_and_free_block();
+        let (plate, block) = (occ(&s, "Plate"), occ(&s, "Block"));
+        run(&mut s, "component.activate", json!({"component": "Plate"}));
+        run(&mut s, "solid.cylinder", json!({"base": [70, 70, 0], "axis": [0, 0, 1], "radius": 3, "height": 10, "operation": "cut"}));
+        run(&mut s, "component.activate", json!({"component": "Block"}));
+        run(&mut s, "solid.cylinder", json!({"base": [40, 50, 50], "axis": [0, 0, 1], "radius": 3, "height": 20, "operation": "cut"}));
+        run(&mut s, "component.activate", json!({"component": "root"}));
+        let r = mate(&mut s, json!({"occurrence": block, "face": [31, 41, 50]}), json!({"occurrence": plate, "face": [5, 5, 10]}), json!({}));
+        assert!(clean(&r), "{r}");
+        (s, plate, block)
+    };
+    // The hole's wall or its rim (the block's bottom rim, at z 10 now): both rims' z point down.
+    for moving in [json!({"face": [43, 50, 11]}), json!({"edge": [43, 50, 10]})] {
+        let (mut s, plate, block) = make();
+        let mut a = moving.clone();
+        a["occurrence"] = json!(block);
+        let r = mate(&mut s, a, json!({"occurrence": plate, "face": [73, 70, 1]}), json!({}));
+        assert!(clean(&r), "{moving}: {r}");
+        assert_eq!(
+            (r["rule"].as_str(), r["kind"].as_str(), r["fell_back"].as_bool()),
+            (Some("concentric"), Some("cylindrical"), Some(false)),
+            "{moving}: {r}"
+        );
+        assert_eq!(dof_of(&r, &s, "Block"), Some(1), "{r}");
+        let c = place(&s, "Block", Vec3::new(40.0, 50.0, 50.0));
+        assert!((c.x - 70.0).abs() < 1e-6 && (c.y - 70.0).abs() < 1e-6 && (c.z - 10.0).abs() < 1e-6, "{moving}: {c:?}");
+    }
+}

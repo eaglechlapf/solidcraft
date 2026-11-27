@@ -6069,6 +6069,8 @@ fn enter_applies(d: &Dialog) -> bool {
     !matches!(d.kind, Kind::Sketch | Kind::Measure { .. } | Kind::ConfirmDelete { .. })
         && !matches!(&d.kind, Kind::Motion(k) if k.wide())
         && !matches!(&d.kind, Kind::Material { editor, .. } if editor.editing())
+        // The Mate tool stays open for the next mate: its pill takes Enter (`dialogs_mate`).
+        && !matches!(&d.kind, Kind::Assembly(crate::dialogs_assembly::Asm::Mate(_)))
 }
 
 /// Dialog OK (`ui.dialog_ok`, a key of the user's choosing, #17416): runs OK in the open dialog on

@@ -630,6 +630,7 @@ pub const SECTIONS: &[Section] = &[
             "joint.as_built",
             "joint.origin",
             "joint.rigid_group",
+            "assembly.mate",
             "assembly.constraint.create",
             "joint.limits",
             "joint.gear",

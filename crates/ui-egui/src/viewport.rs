@@ -5526,6 +5526,9 @@ fn pick_hits(app: &SolveApp, proj: &Proj, pos: Pos2, options: PickOptions<'_>) -
     let edge_reach = if app.dialog.as_ref().is_some_and(crate::dialogs_assembly::takes_snaps) { JOINT_EDGE_REACH } else { 6.0 };
     let mut bestv = Near::new(all);
     let mut beste = Near::new(all);
+    // The Mate tool reads a pick as what it is: a closed edge's one vertex (a hole's or a shaft's
+    // seam) is no corner, and its reach would cover much of a small hole's wall and rim.
+    let no_seams = crate::dialogs_mate::open(app);
     for (i, b) in st.bodies.iter().enumerate() {
         if !through && !crate::viewport::body_shown(app, &b.name) {
             continue;
@@ -5551,6 +5554,11 @@ fn pick_hits(app: &SolveApp, proj: &Proj, pos: Pos2, options: PickOptions<'_>) -
         // Only the segments that can come near the cursor, from the index, in the order a scan
         // of every edge would meet them, so ties go the same way.
         let near = crate::pick_index::segments_near(app.viewport.pick_index.for_edges(&m).as_deref(), &m, lo, ld, reach);
+        let seams: Vec<Vec3> = if no_seams {
+            m.edges.iter().filter_map(|e| e.first().filter(|f| e.len() > 2 && e.last().is_some_and(|l| l.dist(**f) < 1e-9)).copied()).collect()
+        } else {
+            Vec::new()
+        };
         let mut last_edge = None;
         for (ei, si) in near {
             let Some(e) = m.edges.get(ei) else { continue };
@@ -5559,7 +5567,8 @@ fn pick_hits(app: &SolveApp, proj: &Proj, pos: Pos2, options: PickOptions<'_>) -
             }
             if last_edge != Some(ei) {
                 last_edge = Some(ei);
-                for v in [e.first(), e.last()].into_iter().flatten().map(|v| at(*v)) {
+                let corner = |v: &&Vec3| !seams.iter().any(|q| q.dist(**v) < 1e-9);
+                for v in [e.first(), e.last()].into_iter().flatten().filter(corner).map(|v| at(*v)) {
                     if let Some(sp) = proj.to_screen(v) {
                         let dd = sp.distance(pos);
                         if dd < 7.0 && visible(v, body_slack) && bestv.wants(dd) {
@@ -9362,6 +9371,15 @@ fn show_view(app: &mut SolveApp, ui: &mut egui::Ui) {
                 } else {
                     crate::context_menu::open(app, p, held_mods);
                 }
+            } else if crate::dialogs_mate::open(app) {
+                // The Mate tool: a part's planes, axes and sketches, shown to mate to.
+                let body = app.viewport.hover.as_ref().and_then(crate::viewport::hit_sel).and_then(|sel| match sel {
+                    Sel::Face { body, .. } | Sel::Edge { body, .. } | Sel::Vertex { body, .. } | Sel::Body { name: body } => Some(body),
+                    _ => None,
+                });
+                if let Some(body) = body {
+                    crate::dialogs_mate::show_references(app, &body);
+                }
             } else if crate::dialogs_frame::open_menu(app, p) {
                 // A centreline of the Frame Member being made: its Remove Tube menu (#15705).
             } else if app.preferences.right_click_confirms {
@@ -9582,8 +9600,11 @@ fn show_view(app: &mut SolveApp, ui: &mut egui::Ui) {
     // Dragging a part moves its free chain (outside sketches), or reaches within its joints
     // when the chain is anchored. Shift, Ctrl/Cmd or Alt held as the drag starts
     // draws a selection box instead, as a drag from empty space does.
+    // The Mate tool lets a part be dragged too: within its free motion, to try the mechanism or
+    // move the part out of the way. No face is pulled there.
+    let mate_drags = crate::dialogs_mate::drags(app);
     if app.tool.is_none()
-        && app.dialog.is_none()
+        && (app.dialog.is_none() || mate_drags)
         && primary_nav.is_none()
         && mode.is_none()
         && crate::sketch_view::active_sketch(app).is_none()
@@ -9601,6 +9622,7 @@ fn show_view(app: &mut SolveApp, ui: &mut egui::Ui) {
             && !crate::plane_resize::drag_start(app, &proj, a)
             && !crate::occurrence_drag::start(app, &proj, a)
             && !crate::joint_drag::start(app, &proj, a)
+            && !mate_drags
         {
             crate::drag_extrude::press(app, &proj, a);
         }
@@ -14703,6 +14725,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A hole's rim is one closed edge with one vertex, its seam. Other tools pick it as a point;
+    /// the Mate tool reads picks as what they are, so a click there is on the rim or the wall.
+    #[test]
+    fn the_mate_tool_picks_no_seam_vertex_of_a_hole() {
+        let mut s = solidcraft_engine::Session::default();
+        s.execute("solid.box", &json!({"length": 40, "width": 40, "height": 10, "corner": [0, 0, 0]})).unwrap();
+        s.execute("solid.cylinder", &json!({"base": [20, 20, 0], "axis": [0, 0, 1], "radius": 4, "height": 10, "operation": "cut"})).unwrap();
+        let mut app = SolveApp::new(s, crate::Services::default());
+        app.run("view.fit", json!({})).ok();
+        let proj = projection(&app, Rect::from_min_size(Pos2::ZERO, vec2(800., 600.)));
+        let world = crate::open_meshing::session_world(&app.session);
+        let mesh = world.bodies[0].mesh();
+        let seam = mesh
+            .edges
+            .iter()
+            .filter(|e| e.len() > 2 && e[0].dist(e[e.len() - 1]) < 1e-9)
+            .map(|e| e[0])
+            .find(|p| (p.z - 10.0).abs() < 1e-6)
+            .expect("the hole's top rim is a closed edge");
+        let at = proj.to_screen(seam).unwrap();
+        let vertex = |hits: &[Hit]| hits.iter().any(|h| matches!(h, Hit::Vertex { point, .. } if point.dist(seam) < 1e-6));
+        assert!(vertex(&pick_all(&app, &proj, at)), "other tools pick the seam");
+        app.start("assembly.mate");
+        let hits = pick_all(&app, &proj, at);
+        assert!(!vertex(&hits), "{hits:?}");
+        assert!(hits.iter().any(|h| matches!(h, Hit::Edge { .. } | Hit::Face { .. })), "{hits:?}");
     }
 
     #[test]

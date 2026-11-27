@@ -53,6 +53,9 @@ mod inspect;
 #[path = "assembly_constraint.rs"]
 pub(crate) mod constraint;
 
+#[path = "assembly_mate.rs"]
+pub(crate) mod mate;
+
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("joint.origin", "Joint Origin", crate::checked!("joint.origin", joint_origin)).begins_edit()
         .at("SOLID", "CREATE")
@@ -74,8 +77,8 @@ pub static COMMANDS: &[CommandSpec] = &[
         .contract(&CREATE_CONTRACT)
         .output(output_schema_for::<JointAddedResult>)
         .params(
-        "type: rigid|revolute|slider|cylindrical|pin_slot|planar|ball, or a relation: parallel|perpendicular|angle|point_on_plane|point_on_line|line_on_plane \
-         (ties only some directions or points, made where the parts are; several between two parts add up); a, b: joint origins ({occurrence, face|circle|edge|point: [x,y,z] in world, or face|circle: \"<face name>\", sketch: id|name with point|curve, plane: \"XY\"|\"o:<ids>/origin/<item>\"|\"<name>\", axis: \"Z\"|\"o:<ids>/origin/<item>\"|\"<name>\"; z? for a point, end?, x? as joint.origin} | origin name); \
+        "type: rigid|revolute|slider|cylindrical|pin_slot|planar|ball, or a relation: parallel|perpendicular|angle|point_on_plane|point_on_line|line_on_plane|line_on_cylinder|point_on_cylinder \
+         (ties only some directions or points, made where the parts are; several between two parts add up); a, b: joint origins ({occurrence, face|circle|edge|point: [x,y,z] in world, or face|circle: \"<face name>\", plane: \"XY\"|\"o:<ids>/origin/<item>\"|\"<name>\", axis: \"Z\"|\"o:<ids>/origin/<item>\"|\"<name>\"; z? for a point, end?, x? as joint.origin} | origin name); \
          values?: [angles in deg or expressions, distances]; limits?: [[min, max] | null…]; flip?: bool (default false: the origins are mated, \
          b's z against a's as two faces meet - two plane or axis datums mate aligned, each part keeping its side of the datum, and flip mates them; \
          true: b's z along a's, so two origins given at one point with the same z and x stay as they are; \
@@ -1663,7 +1666,7 @@ fn joint_origin(s: &mut Session, p: &Value) -> Result<Value> {
 fn kind_param(p: &Value, cmd: &str) -> Result<JointKind> {
     str_(p, "type")
         .and_then(JointKind::parse)
-        .ok_or_else(|| bad(cmd, "`type` must be rigid, revolute, slider, cylindrical, pin_slot, planar, ball, parallel, perpendicular, angle, point_on_plane, point_on_line or line_on_plane"))
+        .ok_or_else(|| bad(cmd, "`type` must be rigid, revolute, slider, cylindrical, pin_slot, planar, ball, parallel, perpendicular, angle, point_on_plane, point_on_line, line_on_plane, line_on_cylinder or point_on_cylinder"))
 }
 
 fn new_joint_name(s: &Session, p: &Value, kind: JointKind) -> String {
@@ -1682,6 +1685,8 @@ fn new_joint_name(s: &Session, p: &Value, kind: JointKind) -> String {
             JointKind::PointOnPlane => "Point_on_plane",
             JointKind::PointOnLine => "Point_on_line",
             JointKind::LineOnPlane => "Line_on_plane",
+            JointKind::LineOnCylinder => "Line_on_cylinder",
+            JointKind::PointOnCylinder => "Point_on_cylinder",
         };
         let prefix = format!("{label} Joint");
         let names: std::collections::BTreeSet<_> = s.doc.assembly.joints.iter().map(|j| j.name.as_str()).collect();

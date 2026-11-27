@@ -186,6 +186,9 @@ pub(crate) fn symbol(kind: JointKind) -> Symbol {
         JointKind::PointOnPlane => (vec![plate()], vec![(centre, POINT)]),
         JointKind::PointOnLine => (vec![vec![[-1.15, 0.0], [1.15, 0.0]]], vec![(centre, POINT)]),
         JointKind::LineOnPlane => (vec![plate(), vec![[-1.15, 0.0], [1.15, 0.0]]], Vec::new()),
+        // A ring with a line (or a point) resting on its rim.
+        JointKind::LineOnCylinder => (vec![arc(centre, 0.7, 0.0, TAU), vec![[-1.15, 0.7], [1.15, 0.7]]], Vec::new()),
+        JointKind::PointOnCylinder => (vec![arc(centre, 0.7, 0.0, TAU)], vec![([0.0, 0.7], POINT)]),
     };
     Symbol { lines, dots }
 }
@@ -272,7 +275,9 @@ pub(crate) fn family(kind: JointKind) -> Family {
         JointKind::Rigid => Family::Fixed,
         JointKind::Revolute | JointKind::Slider | JointKind::Cylindrical | JointKind::PinSlot | JointKind::Planar | JointKind::Ball => Family::Motion,
         JointKind::Parallel | JointKind::Perpendicular | JointKind::Angle => Family::Relation,
-        JointKind::PointOnPlane | JointKind::PointOnLine | JointKind::LineOnPlane => Family::Contact,
+        JointKind::PointOnPlane | JointKind::PointOnLine | JointKind::LineOnPlane | JointKind::LineOnCylinder | JointKind::PointOnCylinder => {
+            Family::Contact
+        }
     }
 }
 

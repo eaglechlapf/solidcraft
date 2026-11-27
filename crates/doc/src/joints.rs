@@ -578,6 +578,13 @@ pub enum JointKind {
     /// B's z axis lies in A's xy plane (`offset` off it: a cylinder's radius makes it tangent);
     /// B slides on the plane, turns about A's z and about its own axis.
     LineOnPlane,
+    /// B's z axis stays parallel to A's z, `offset` away from it: a line or a cylinder's axis
+    /// resting on a cylinder (`offset` the radii). B turns round A's axis, slides along it and
+    /// spins about its own axis.
+    LineOnCylinder,
+    /// B's origin stays `offset` from A's z axis: a point on a cylinder's wall. B turns round A's
+    /// axis, slides along it and turns any way about its origin.
+    PointOnCylinder,
 }
 
 impl JointKind {
@@ -596,6 +603,8 @@ impl JointKind {
             "pointonplane" | "pointonface" => JointKind::PointOnPlane,
             "pointonline" | "pointonaxis" => JointKind::PointOnLine,
             "lineonplane" | "lineonface" => JointKind::LineOnPlane,
+            "lineoncylinder" => JointKind::LineOnCylinder,
+            "pointoncylinder" => JointKind::PointOnCylinder,
             _ => return None,
         })
     }
@@ -614,6 +623,8 @@ impl JointKind {
             JointKind::PointOnPlane => &["x", "y", "yaw", "pitch", "roll"],
             JointKind::PointOnLine => &["slide", "yaw", "pitch", "roll"],
             JointKind::LineOnPlane => &["x", "y", "turn", "spin"],
+            JointKind::LineOnCylinder => &["turn", "slide", "spin"],
+            JointKind::PointOnCylinder => &["turn", "slide", "yaw", "pitch", "roll"],
         }
     }
     pub fn is_angle(self, i: usize) -> bool {
@@ -631,6 +642,8 @@ impl JointKind {
                 | JointKind::PointOnPlane
                 | JointKind::PointOnLine
                 | JointKind::LineOnPlane
+                | JointKind::LineOnCylinder
+                | JointKind::PointOnCylinder
         )
     }
 }
@@ -1419,6 +1432,8 @@ pub fn motion(kind: JointKind, q: &[f64]) -> Mat {
         JointKind::PointOnPlane => shift(v(0), v(1), 0.0),
         JointKind::PointOnLine => shift(0.0, 0.0, v(0)),
         JointKind::LineOnPlane => mat_mul(&shift(v(0), v(1), 0.0), &rot_z(v(2))),
+        // The radius (`offset`) is laid along x by the mate (`flip_of`), after the turn.
+        JointKind::LineOnCylinder | JointKind::PointOnCylinder => mat_mul(&rot_z(v(0)), &shift(0.0, 0.0, v(1))),
     }
 }
 
@@ -1438,6 +1453,8 @@ fn tail(j: &Joint, q: &[f64]) -> Mat {
         JointKind::LineOnPlane => mat_mul(&rot_y(std::f64::consts::FRAC_PI_2), &rot_z(v(3))),
         JointKind::PointOnPlane => turn_zyx(v(2), v(3), v(4)),
         JointKind::PointOnLine => turn_zyx(v(1), v(2), v(3)),
+        JointKind::LineOnCylinder => rot_z(v(2)),
+        JointKind::PointOnCylinder => turn_zyx(v(2), v(3), v(4)),
         _ => IDENTITY,
     }
 }
@@ -1942,7 +1959,12 @@ pub fn flip_of(j: &Joint) -> Mat {
     // An angle relation's `angle` is its tilt (`tail`); a perpendicular one has none.
     let turn = if matches!(j.kind, JointKind::Angle | JointKind::Perpendicular) { 0.0 } else { j.angle };
     let mut m = rot_z(turn);
-    m[3][2] = j.offset;
+    // On a cylinder the offset is the distance from A's axis, laid along x; else it is along z.
+    if matches!(j.kind, JointKind::LineOnCylinder | JointKind::PointOnCylinder) {
+        m[3][0] = j.offset;
+    } else {
+        m[3][2] = j.offset;
+    }
     let datums = matches!(j.a.snap, Snap::Plane { .. } | Snap::Axis { .. }) && matches!(j.b.snap, Snap::Plane { .. } | Snap::Axis { .. });
     if datums == j.flip { mat_mul(&m, &[[1.0, 0.0, 0.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]) } else { m }
 }
@@ -4014,6 +4036,8 @@ mod tests {
                 JointKind::PointOnPlane,
                 JointKind::PointOnLine,
                 JointKind::LineOnPlane,
+                JointKind::LineOnCylinder,
+                JointKind::PointOnCylinder,
             ] {
                 joint.kind = kind;
                 joint.offset = 2.7;

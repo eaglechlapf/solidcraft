@@ -8,6 +8,9 @@
 macro_rules! design_preferences {
     ($next:ident $(, $rest:ident)* ; $($fields:tt)*) => {
         $next! { $($rest),* ; $($fields)*
+            /// The Mate tool slides the part it mates into place (`dialogs_mate`). Off: the part is
+            /// put there at once.
+            animate_mates: bool = true, PAGE_DESIGN => check_id("prefs.animate_mates");
             angle_decimals: u8 = 1, PAGE_DESIGN;
             /// The template new drawings of an assembly start from: an assembly's built-in, by name (ISO A2
             /// when not set, or set to one this version doesn't have for an assembly), or a template

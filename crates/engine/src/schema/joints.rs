@@ -279,7 +279,7 @@ impl JsonSchema for OccurrenceKey {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct JointTypeParam(pub JointKind);
 
-const TYPE_MESSAGE: &str = "`type` must be rigid, revolute, slider, cylindrical, pin_slot, planar, ball, parallel, perpendicular, angle, point_on_plane, point_on_line or line_on_plane";
+const TYPE_MESSAGE: &str = "`type` must be rigid, revolute, slider, cylindrical, pin_slot, planar, ball, parallel, perpendicular, angle, point_on_plane, point_on_line, line_on_plane, line_on_cylinder or point_on_cylinder";
 
 /// The spellings `JointKind::parse` takes, canonical ones first.
 const JOINT_TYPES: &[&str] = &[
@@ -296,6 +296,8 @@ const JOINT_TYPES: &[&str] = &[
     "point_on_plane",
     "point_on_line",
     "line_on_plane",
+    "line_on_cylinder",
+    "point_on_cylinder",
     "rotate",
     "slide",
     "square",
@@ -316,7 +318,7 @@ impl JsonSchema for JointTypeParam {
     }
     fn json_schema(_: &mut SchemaGenerator) -> Schema {
         json_schema!({
-            "description": "A joint's type: rigid, revolute (turns), slider (slides), cylindrical (both), pin_slot, planar or ball; or a relation that ties only some directions or points, made where the parts are: parallel, perpendicular, angle, point_on_plane, point_on_line or line_on_plane. Case, spaces, `_` and `-` are ignored, and rotate, slide, square, point_on_face, point_on_axis and line_on_face are also taken.",
+            "description": "A joint's type: rigid, revolute (turns), slider (slides), cylindrical (both), pin_slot, planar or ball; or a relation that ties only some directions or points, made where the parts are: parallel, perpendicular, angle, point_on_plane, point_on_line, line_on_plane, line_on_cylinder or point_on_cylinder. Case, spaces, `_` and `-` are ignored, and rotate, slide, square, point_on_face, point_on_axis and line_on_face are also taken.",
             "type": "string",
             "examples": JOINT_TYPES
         })
@@ -793,6 +795,141 @@ impl<'de> Deserialize<'de> for CreateConstraintParams {
             quiet: flag(&m, "quiet")?,
         })
     }
+}
+
+/// How `assembly.mate` joins its two picks, when not as the picks suggest.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum MateMode {
+    /// As the picks suggest: two flat faces mate, two cylinders line up on one axis, a straight
+    /// edge rests on a cylinder.
+    Auto,
+    /// Two flat faces at `angle`.
+    Angle,
+    /// Two cylinders side by side, or a cylinder on a flat face.
+    Tangent,
+    /// A straight edge on a cylinder's axis.
+    Axial,
+}
+
+impl MateMode {
+    fn read(v: &Value) -> Result<Self, String> {
+        match v.as_str() {
+            Some("auto") => Ok(MateMode::Auto),
+            Some("angle") => Ok(MateMode::Angle),
+            Some("tangent") => Ok(MateMode::Tangent),
+            Some("axial") => Ok(MateMode::Axial),
+            _ => Err("`mode` must be auto, angle, tangent or axial".into()),
+        }
+    }
+}
+
+/// The lowest and highest gap: two lengths in mm, or expressions.
+#[derive(Debug)]
+pub struct MateLimits(pub Vec<Value>);
+
+impl MateLimits {
+    fn read(v: &Value) -> Result<Self, String> {
+        match v {
+            Value::Array(pair) if pair.len() == 2 => pair.iter().try_for_each(JointValue::check).map(|()| MateLimits(pair.clone())),
+            _ => Err("`limits` must be [min, max]".into()),
+        }
+    }
+}
+
+impl JsonSchema for MateLimits {
+    fn schema_name() -> Cow<'static, str> {
+        "MateLimits".into()
+    }
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let value = generator.subschema_for::<JointValue>();
+        json_schema!({ "type": "array", "items": value, "minItems": 2, "maxItems": 2 })
+    }
+}
+
+/// Join two parts from a pick on each, the way the picks suggest (two flat faces mate, two
+/// cylinders line up on one axis, a cylinder rests on a flat face, a point lies on a face). The
+/// rule is kept as a joint of the kind it needs, made where the parts are, so the part that moves
+/// (side a) moves no further than the rule needs. An alignment the parts' other joints won't let
+/// meet falls back to parallel at whatever distance the parts are. One undo step.
+#[derive(Debug, JsonSchema)]
+#[schemars(deny_unknown_fields, transform = mate_required)]
+pub struct MateParams {
+    /// The pick on the part that moves: a joint origin as joint.create takes it, where `face` may
+    /// be a flat or a cylindrical face and `edge` a straight or round edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "JointOriginArg")]
+    pub a: Option<JointOriginArg>,
+    /// The pick it moves to, as `a`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "JointOriginArg")]
+    pub b: Option<JointOriginArg>,
+    /// How to join them. Default: auto.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "MateMode")]
+    pub mode: Option<MateMode>,
+    /// The gap, in mm or an expression. Default: 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "JointValue")]
+    pub offset: Option<JointValue>,
+    /// The angle mode's angle, in degrees or an expression.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "JointValue")]
+    pub angle: Option<JointValue>,
+    /// Turn the moving part over: two flat faces flush instead of against each other. Default: false.
+    #[serde(default)]
+    pub flip: Option<bool>,
+    /// Stop two parts on one axis turning about it. Default: false.
+    #[serde(default)]
+    pub lock: Option<bool>,
+    /// The lowest and highest gap between two flat faces, instead of one gap: the part slides
+    /// between them. Default: none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "MateLimits")]
+    pub limits: Option<MateLimits>,
+    /// The joint's name. Default: its type and the first free number.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Leave out `dof` and `fixed` in the reply. Default: false.
+    #[serde(default)]
+    pub quiet: Option<bool>,
+}
+
+fn mate_required(schema: &mut Schema) {
+    require(schema, "a");
+    require(schema, "b");
+}
+
+impl<'de> Deserialize<'de> for MateParams {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let m = keys(d)?;
+        Ok(MateParams {
+            a: given(&m, "a", JointOriginArg::read)?,
+            b: given(&m, "b", JointOriginArg::read)?,
+            mode: given(&m, "mode", MateMode::read)?,
+            offset: given(&m, "offset", JointValue::read)?,
+            angle: given(&m, "angle", JointValue::read)?,
+            flip: flag(&m, "flip")?,
+            lock: flag(&m, "lock")?,
+            limits: given(&m, "limits", MateLimits::read)?,
+            name: text(&m, "name")?,
+            quiet: flag(&m, "quiet")?,
+        })
+    }
+}
+
+/// What `assembly.mate` returns: the joint added, the rule it keeps, and the solve after it.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct MateResult {
+    #[serde(flatten)]
+    pub added: JointAddedResult,
+    /// The rule kept: mate, flush, angle, parallel, tangent, concentric, insert, line_on_plane,
+    /// point_on_plane, point_on_cylinder, point_on_axis or coincident.
+    pub rule: String,
+    /// The joint's type.
+    pub kind: String,
+    /// True when the alignment asked for could not be met and the parts were made parallel.
+    pub fell_back: bool,
 }
 
 /// Change a constraint (a joint made with `assembly.constraint.create`) in place: its rule, gap,

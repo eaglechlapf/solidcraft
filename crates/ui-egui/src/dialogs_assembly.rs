@@ -201,6 +201,7 @@ pub enum Asm {
     Coupling(Box<crate::dialogs_coupling::CouplingForm>),
     Cam(Box<crate::dialogs_coupling::cam::CamForm>),
     Constrain(Box<crate::dialogs_constrain::ConstrainForm>),
+    Mate(Box<crate::dialogs_mate::MateForm>),
     Interference {
         result: Option<Value>,
         overlaps: Vec<Mesh>,
@@ -409,6 +410,7 @@ impl Asm {
             },
             Asm::Cam(_) => "CAM",
             Asm::Constrain(_) => "CONSTRAIN",
+            Asm::Mate(_) => "MATE",
             Asm::Interference { .. } => "INTERFERENCE",
             Asm::Trace(_) => "MOTION TRACE",
         }
@@ -459,6 +461,7 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
         "joint.gear" | "joint.rack_pinion" | "joint.screw" => crate::dialogs_coupling::start(app, id)?,
         "joint.cam" => crate::dialogs_coupling::cam::start(app),
         "assembly.constraint.create" => crate::dialogs_constrain::start(app)?,
+        "assembly.mate" => crate::dialogs_mate::start(app)?,
         "inspect.interference" => (
             Asm::Interference { result: None, overlaps: Vec::new(), of: Vec::new(), clearance: "0".into(), check: None },
             vec![SelInput::new("Bodies (all if none)", BODIES, true)],
@@ -1825,6 +1828,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Asm, inputs: &mut Vec
         Asm::Coupling(f) => enter |= crate::dialogs_coupling::rows(app, ui, f, inputs),
         Asm::Cam(f) => enter |= crate::dialogs_coupling::cam::rows(app, ui, f, inputs),
         Asm::Constrain(f) => enter |= crate::dialogs_constrain::rows(app, ui, f, inputs, active),
+        Asm::Mate(f) => enter |= crate::dialogs_mate::rows(app, ui, f, inputs, active),
         Asm::Interference { result, overlaps, of, clearance, check } => {
             let picked: Vec<Sel> = inputs.first().map(|i| i.items.clone()).unwrap_or_default();
             if let Some(c) = check.take() {
@@ -2952,6 +2956,7 @@ pub fn commands(app: &SolveApp, k: &Asm, inputs: &[SelInput]) -> Result<Vec<(Str
         Asm::Coupling(f) => return crate::dialogs_coupling::commands(app, f, inputs),
         Asm::Cam(f) => return crate::dialogs_coupling::cam::commands(app, f, inputs),
         Asm::Constrain(f) => return crate::dialogs_constrain::commands(app, f, inputs),
+        Asm::Mate(f) => return crate::dialogs_mate::commands(app, f, inputs),
         // The check runs from its Compute button; OK only closes.
         Asm::Interference { .. } => Vec::new(),
         Asm::Trace(f) => cmd("motion.trace.keep", trace::params(s, f, inputs)?),
@@ -3193,13 +3198,17 @@ pub fn overlay(app: &SolveApp, painter: &egui::Painter, proj: &Proj, d: &mut Dia
     if let Asm::Trace(f) = k {
         trace::overlay(painter, proj, f);
     }
+    if let Asm::Mate(f) = k {
+        crate::dialogs_mate::overlay(app, painter, proj, f);
+    }
     // A joint and a constraint name their two picks; a joint origin and a trace have one.
-    let two = matches!(k, Asm::Joint(_) | Asm::Constrain(_));
+    let two = matches!(k, Asm::Joint(_) | Asm::Constrain(_) | Asm::Mate(_));
     let hover = match k {
         Asm::Joint(f) => Some(&mut f.hover),
         Asm::JointOrigin { hover, .. } => Some(hover),
         Asm::Trace(f) => Some(&mut f.hover),
         Asm::Constrain(f) => Some(&mut f.hover),
+        Asm::Mate(f) => Some(&mut f.hover),
         _ => None,
     };
     let Some(hover) = hover else { return };

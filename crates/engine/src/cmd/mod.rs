@@ -682,6 +682,7 @@ fn gather_command_specs() -> Vec<&'static CommandSpec> {
     v.extend(component_link::COMMANDS.iter());
     v.extend(joints::COMMANDS.iter());
     v.extend(joints::constraint::COMMANDS.iter());
+    v.extend(joints::mate::COMMANDS.iter());
     v.extend(clearance::COMMANDS.iter());
     v.extend(hole_stacks::COMMANDS.iter());
     v.extend(socket_reach::COMMANDS.iter());
