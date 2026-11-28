@@ -24,27 +24,6 @@ use crate::viewport::Proj;
 /// How long the part takes to slide into place.
 const SLIDE_MS: f64 = 350.0;
 
-/// How the two picks are joined, when not as they suggest.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Mode {
-    #[default]
-    Auto,
-    Angle,
-    Tangent,
-    Axial,
-}
-
-impl Mode {
-    fn name(self) -> &'static str {
-        match self {
-            Mode::Auto => "auto",
-            Mode::Angle => "angle",
-            Mode::Tangent => "tangent",
-            Mode::Axial => "axial",
-        }
-    }
-}
-
 /// A mate made and shown: its picks, what it was made with and the engine's answer (its rule,
 /// joint type, the freedom left, conflicts).
 #[derive(Clone, Debug)]
@@ -71,10 +50,18 @@ pub struct Slide {
 
 #[derive(Clone, Debug, Default)]
 pub struct MateForm {
-    pub mode: Mode,
-    /// The gap, and the angle mode's angle (lengths, angles or expressions).
+    /// The rule picked on the pill (`assembly.mate`'s `rule`); none: the one the picks suggest.
+    pub rule: Option<String>,
+    /// The gap, and the angle rule's angle (lengths, angles or expressions).
     pub distance: String,
     pub angle: String,
+    /// The angle was typed: without it, the angle rule keeps the angle the faces are at.
+    pub angle_set: bool,
+    /// The angle rule measures the supplement of the angle between the directions (`assembly.mate`'s
+    /// `reverse`), picked on its arcs; none: as the engine measures it by default.
+    pub measure: Option<bool>,
+    /// Which of the four arcs (`angle_arcs`) shows the angle measured: two show each angle.
+    pub sector: Option<usize>,
     pub flip: bool,
     pub lock: bool,
     /// The gap between two flat faces slides between `min` and `max` instead (or the angle
@@ -129,9 +116,12 @@ pub fn start(_app: &SolveApp) -> Option<(Asm, Vec<SelInput>)> {
 /// The values one mate had, back to the defaults for the next.
 fn reset(f: &mut MateForm) {
     let next = start_form();
-    f.mode = next.mode;
+    f.rule = None;
     f.distance = next.distance;
     f.angle = next.angle;
+    f.angle_set = false;
+    f.measure = None;
+    f.sector = None;
     f.flip = false;
     f.lock = false;
     f.limits = false;
@@ -166,16 +156,15 @@ fn pick_param(app: &SolveApp, sel: &Sel) -> Option<Value> {
     Some(v)
 }
 
+/// The rule the shown mate is asked to keep: the one picked on the pill, or the one the picks
+/// suggest (the first of the engine's `choices`).
+fn wanted(f: &MateForm) -> Option<String> {
+    f.rule.clone().or_else(|| f.applied.as_ref().and_then(|a| a.reply["choices"].get(0)?.as_str().map(str::to_string)))
+}
+
 /// Whether the gap or the angle can take limits: two flat faces mated, or at an angle.
 fn limitable(f: &MateForm) -> bool {
-    f.applied.as_ref().is_some_and(|a| {
-        let rule = a.reply["rule"].as_str().unwrap_or_default();
-        match f.mode {
-            Mode::Auto => matches!(rule, "mate" | "flush") || (a.params.get("limits").is_some() && a.reply["kind"] == "parallel"),
-            Mode::Angle => rule == "angle",
-            _ => false,
-        }
-    })
+    f.applied.is_some() && matches!(wanted(f).as_deref(), Some("mate" | "angle"))
 }
 
 /// `assembly.mate`'s parameters for `picks` with the form's values.
@@ -184,13 +173,20 @@ fn params(app: &SolveApp, f: &MateForm, picks: &[Sel; 2]) -> Result<Value, Strin
     let a = pick_param(app, &picks[0]).ok_or_else(hint)?;
     let b = pick_param(app, &picks[1]).ok_or_else(hint)?;
     let mut p = json!({"a": a, "b": b});
-    if f.mode != Mode::Auto {
-        p["mode"] = json!(f.mode.name());
+    if let Some(rule) = &f.rule {
+        p["rule"] = json!(rule);
     }
-    if f.mode == Mode::Angle && f.limits && limitable(f) {
+    let angular = f.rule.as_deref() == Some("angle");
+    if let Some(reverse) = f.measure.filter(|_| angular) {
+        p["reverse"] = json!(reverse);
+    }
+    if angular && f.limits && limitable(f) {
         p["limits"] = json!([f.min_angle.trim(), f.max_angle.trim()]);
-    } else if f.mode == Mode::Angle {
-        p["angle"] = json!(f.angle.trim());
+    } else if angular {
+        // Untyped, the faces keep the angle they are at.
+        if f.angle_set {
+            p["angle"] = json!(f.angle.trim());
+        }
     } else if f.limits && limitable(f) {
         p["limits"] = json!([f.min.trim(), f.max.trim()]);
     } else {
@@ -285,35 +281,55 @@ fn move_params(id: u64, m: &Mat) -> Value {
 
 /// Make the mate for two new picks: the part slides there first, when the mate moves it.
 fn begin(app: &mut SolveApp, ctx: &egui::Context, f: &mut MateForm, picks: [Sel; 2], inputs: &mut [SelInput]) {
-    let p = match params(app, f, &picks) {
-        Ok(p) => p,
+    match params(app, f, &picks) {
+        Ok(p) => place(app, ctx, f, picks, p, inputs, None),
         Err(e) => {
             f.error = Some(e);
             if let Some(i) = inputs.get_mut(1) {
                 i.items.clear();
             }
-            return;
         }
-    };
-    // Where the mate puts the parts, worked out on a copy.
+    }
+}
+
+/// Make mate `p` from where the parts are now: where it puts them is worked out on a copy, and the
+/// parts slide there, then the mate is made. `was` is the mate shown before (taken back already, so
+/// the parts are where they were before it) and where it showed the parts: they slide from there,
+/// and it is made again when `p` doesn't fit.
+fn place(
+    app: &mut SolveApp,
+    ctx: &egui::Context,
+    f: &mut MateForm,
+    picks: [Sel; 2],
+    p: Value,
+    inputs: &mut [SelInput],
+    was: Option<(Applied, Vec<(u64, Mat)>)>,
+) {
     let mut scratch = app.session.scratch();
     if let Err(e) = scratch.execute("assembly.mate", &p) {
         f.error = Some(e.to_string());
-        // The second pick didn't fit: pick another.
-        if let Some(i) = inputs.get_mut(1) {
-            i.items.clear();
+        match was {
+            Some((was, _)) => restore(app, f, was),
+            // The second pick didn't fit: pick another.
+            None => {
+                if let Some(i) = inputs.get_mut(1) {
+                    i.items.clear();
+                }
+            }
         }
         return;
     }
+    let shown = |id: u64| was.as_ref().and_then(|(_, at)| at.iter().find(|(o, _)| *o == id).map(|(_, m)| *m));
+    let differs = |a: &Mat, b: &Mat| a.iter().flatten().zip(b.iter().flatten()).any(|(x, y)| (x - y).abs() > 1e-9);
     let moves: Vec<(u64, Mat, Mat)> = scratch
         .doc
         .occurrences
         .iter()
         .filter(|o| !o.grounded)
         .filter_map(|o| {
-            let was = app.session.doc.occurrences.iter().find(|x| x.id == o.id)?;
-            let moved = was.transform.iter().flatten().zip(o.transform.iter().flatten()).any(|(a, b)| (a - b).abs() > 1e-9);
-            moved.then_some((o.id, was.transform, o.transform))
+            let start = app.session.doc.occurrences.iter().find(|x| x.id == o.id)?.transform;
+            let from = shown(o.id).unwrap_or(start);
+            differs(&from, &o.transform).then_some((o.id, from, o.transform))
         })
         .collect();
     if moves.is_empty() || !app.preferences.animate_mates {
@@ -321,7 +337,21 @@ fn begin(app: &mut SolveApp, ctx: &egui::Context, f: &mut MateForm, picks: [Sel;
         return;
     }
     f.slide = Some(Slide { started: crate::now_ms(), moves, picks, params: p, depth: app.session.undo.len() });
+    // Its first frame now: the parts taken back to where they were must not show there first.
+    if was.is_some() {
+        slide(app, ctx, f, inputs);
+    }
     ctx.request_repaint();
+}
+
+/// Make mate `was` again after one asked for on the pill didn't fit, with the pill as it was.
+fn restore(app: &mut SolveApp, f: &mut MateForm, was: Applied) {
+    f.rule = was.params.get("rule").and_then(Value::as_str).map(str::to_string);
+    f.flip = was.params.get("flip") == Some(&json!(true));
+    f.lock = was.params.get("lock") == Some(&json!(true));
+    if let Ok(reply) = app.run("assembly.mate", was.params.clone()) {
+        f.applied = Some(Applied { reply, depth: app.session.undo.len(), ..was });
+    }
 }
 
 /// A frame of the slide; the mate is made at its end.
@@ -353,6 +383,10 @@ fn slide(app: &mut SolveApp, ctx: &egui::Context, f: &mut MateForm, inputs: &mut
 fn apply(app: &mut SolveApp, f: &mut MateForm, picks: [Sel; 2], p: Value, inputs: &mut [SelInput]) {
     match app.run("assembly.mate", p.clone()) {
         Ok(reply) => {
+            // An angle not typed is the one the faces were at: the pill shows it, to type over.
+            if let Some(deg) = reply["angle"].as_f64().filter(|_| !f.angle_set) {
+                f.angle = format!("{} deg", crate::dialogs_coupling::trim(deg));
+            }
             f.applied = Some(Applied { picks, params: p, reply, depth: app.session.undo.len() });
             f.error = None;
             f.focus = true;
@@ -366,29 +400,22 @@ fn apply(app: &mut SolveApp, f: &mut MateForm, picks: [Sel; 2], p: Value, inputs
     }
 }
 
-/// Make the shown mate again with the values now: taken back and made anew, still one undo step.
-/// A value it refuses keeps the mate as it was.
-fn reapply(app: &mut SolveApp, f: &mut MateForm) {
+/// Make the shown mate again with the pill's values now, still one undo step: taken back, so the
+/// parts are where they were before the second pick, and worked out again from there (each rule
+/// moves the part only as far as it needs from there); the parts slide from where they are shown.
+/// A rule or value it refuses keeps the mate as it was.
+fn reapply(app: &mut SolveApp, ctx: &egui::Context, f: &mut MateForm, inputs: &mut [SelInput]) {
     let Some(was) = f.applied.clone() else { return };
     let Ok(p) = params(app, f, &was.picks) else { return };
     if p == was.params {
         return;
     }
+    let shown: Vec<(u64, Mat)> = app.session.doc.occurrences.iter().map(|o| (o.id, o.transform)).collect();
     if app.run("edit.undo", json!({})).is_err() {
         return;
     }
-    match app.run("assembly.mate", p.clone()) {
-        Ok(reply) => {
-            f.applied = Some(Applied { picks: was.picks, params: p, reply, depth: app.session.undo.len() });
-            f.error = None;
-        }
-        Err(e) => {
-            f.error = Some(e);
-            if let Ok(reply) = app.run("assembly.mate", was.params.clone()) {
-                f.applied = Some(Applied { reply, depth: app.session.undo.len(), ..was });
-            }
-        }
-    }
+    f.applied = None;
+    place(app, ctx, f, was.picks.clone(), p, inputs, Some((was, shown)));
 }
 
 /// What the picks and the pill ask, each frame.
@@ -432,7 +459,7 @@ fn step(app: &mut SolveApp, ctx: &egui::Context, f: &mut MateForm, inputs: &mut 
         }
         if f.changed {
             f.changed = false;
-            reapply(app, f);
+            reapply(app, ctx, f, inputs);
         }
         // The next click picks the next part to move.
         *active = 0;
@@ -461,7 +488,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, f: &mut MateForm, inputs: &mu
         status_line(ui, solidcraft_ui_text::tr(h), StatusTone::Dim);
     }
     if limitable(f) {
-        let angular = f.mode == Mode::Angle;
+        let angular = wanted(f).as_deref() == Some("angle");
         let before = (f.limits, f.min.clone(), f.max.clone(), f.min_angle.clone(), f.max_angle.clone());
         crate::ui_kit::options(ui, "mate_options", &mut [(solidcraft_ui_text::tr("mate.limits"), &mut f.limits)]);
         if f.limits {
@@ -533,9 +560,28 @@ fn rule_label(rule: &str) -> &'static str {
     })
 }
 
-/// A toggle in the pill; true when clicked.
+/// A rule's icon: the one the Constrain tool shows for it, or a point on something.
+fn rule_icon(rule: &str) -> &'static str {
+    match rule {
+        "mate" => "constraint_mate",
+        "flush" => "constraint_flush",
+        "angle" => "constraint_angle",
+        "parallel" => "constraint_parallel",
+        "tangent" => "constraint_tangent",
+        "concentric" => "constraint_concentric",
+        "insert" => "constraint_insert",
+        "point_on_axis" => "constraint_point_on_axis",
+        "line_on_plane" | "point_on_plane" | "point_on_cylinder" => "constraint_distance",
+        _ => "c_coincident",
+    }
+}
+
 /// A switch of the pill as an icon, its name on hover (and to screen readers).
 fn icon_toggle(ui: &mut egui::Ui, icon: &str, label: &str, on: bool, handle: &str) -> bool {
+    icon_button(ui, icon, label, on, handle).clicked()
+}
+
+fn icon_button(ui: &mut egui::Ui, icon: &str, label: &str, on: bool, handle: &str) -> egui::Response {
     let t = solidcraft_theme::Tokens::get();
     let side = t.control_height;
     let r = ui.add(egui::Button::new("").selected(on).min_size(egui::vec2(side, side)).sense(egui::Sense::CLICK));
@@ -543,13 +589,351 @@ fn icon_toggle(ui: &mut egui::Ui, icon: &str, label: &str, on: bool, handle: &st
     r.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, label));
     t.button_bevel(ui, &r, on);
     crate::scenario::publish_handle(handle, r.rect.center());
-    r.backing_on_hover_text(label).clicked()
+    crate::scenario::publish_rect(handle, r.rect);
+    r.backing_on_hover_text(label)
+}
+
+/// The rules the two picks take, one button each: the one kept is on, the one the picks suggest
+/// has a dot under it (and says so on hover). A click makes the mate again by that rule, from where
+/// the part was before the second pick; the suggested one goes back to letting the picks decide.
+fn rule_buttons(ui: &mut egui::Ui, f: &mut MateForm, choices: &[String], kept: &str) {
+    if choices.len() < 2 {
+        return;
+    }
+    let t = solidcraft_theme::Tokens::get();
+    // Mate turned over is flush: one button, named and drawn as what it is.
+    let kept = if kept == "flush" { "mate" } else { kept };
+    for (i, choice) in choices.iter().enumerate() {
+        let shown = if choice == "mate" && f.flip { "flush" } else { choice.as_str() };
+        let name = rule_label(shown);
+        let suggested = i == 0;
+        let tip = if suggested { solidcraft_ui_text::format("mate.suggested", &[("rule", name)]) } else { name.to_string() };
+        let r = icon_button(ui, rule_icon(shown), &tip, choice == kept, &format!("mate:rule:{choice}"));
+        // In the button's corner, clear of the icon (a concentric icon ends in a dot of its own).
+        if suggested {
+            ui.painter().circle_filled(r.rect.right_top() + egui::vec2(-t.space_4, t.space_4), 2.0, t.accent);
+        }
+        if r.clicked() && choice != kept {
+            f.rule = if suggested { None } else { Some(choice.clone()) };
+            // What the last rule was set to may not fit this one: turned over, between limits.
+            f.flip = false;
+            f.limits = false;
+            f.angle_set = false;
+            f.measure = None;
+            f.sector = None;
+            f.changed = true;
+        }
+    }
 }
 
 fn toggle(ui: &mut egui::Ui, label: &str, on: bool, handle: &str) -> bool {
     let r = crate::ui_kit::button(ui, label, if on { crate::ui_kit::Button::SmallSelected } else { crate::ui_kit::Button::Small });
     crate::scenario::publish_handle(handle, r.rect.center());
     r.clicked()
+}
+
+/// How far from the pick the angle arcs are drawn, in points.
+const ARC_RADIUS: f32 = 48.0;
+
+fn unit(v: Vec3) -> Option<Vec3> {
+    let l = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
+    (l > 1e-9 && l.is_finite()).then(|| Vec3::new(v.x / l, v.y / l, v.z / l))
+}
+
+fn dot(a: Vec3, b: Vec3) -> f64 {
+    a.x * b.x + a.y * b.y + a.z * b.z
+}
+
+/// `at` moved `k` along `d`.
+fn along(at: Vec3, d: Vec3, k: f64) -> Vec3 {
+    Vec3::new(at.x + d.x * k, at.y + d.y * k, at.z + d.z * k)
+}
+
+/// An angle `x deg` (or a plain number) as its supplement, `180 - x deg`; none for an expression.
+fn supplement(angle: &str) -> Option<String> {
+    let v: f64 = angle.trim().trim_end_matches("deg").trim_end_matches('°').trim().parse().ok()?;
+    Some(format!("{} deg", crate::dialogs_coupling::trim(180.0 - v)))
+}
+
+/// Measure the angle on arc `i` (`angle_arcs`), which measures the supplement (`supplementary`) or
+/// not; the angle measured now is the supplement when `reverse`. Measured the other way, a typed
+/// angle and limits turn into their supplements, and the part stays where it is.
+fn measure_on(f: &mut MateForm, i: usize, supplementary: bool, reverse: bool) {
+    f.sector = Some(i);
+    if supplementary == reverse {
+        return;
+    }
+    f.measure = Some(supplementary);
+    // The joint is the same either way (60 degrees between the normals is 120 against one
+    // reversed): only what the value means changes, so the mate shown is kept as it is, its
+    // parameters and answer brought up to date. Made again from where the part was, parallel faces
+    // could tip it another way just as near.
+    let Some(a) = f.applied.as_mut() else { return };
+    let keep = if f.limits {
+        match (supplement(&f.max_angle), supplement(&f.min_angle)) {
+            (Some(lo), Some(hi)) => {
+                (f.min_angle, f.max_angle) = (lo, hi);
+                a.params["limits"] = json!([f.min_angle.trim(), f.max_angle.trim()]);
+                true
+            }
+            _ => false,
+        }
+    } else {
+        match supplement(&f.angle) {
+            Some(v) => {
+                f.angle = v;
+                if f.angle_set {
+                    a.params["angle"] = json!(f.angle.trim());
+                }
+                true
+            }
+            // An expression can't be turned round: the angle the parts are at, measured anew.
+            None => {
+                f.angle_set = false;
+                false
+            }
+        }
+    };
+    if keep {
+        a.params["reverse"] = json!(supplementary);
+        a.reply["reverse"] = json!(supplementary);
+        if let Some(deg) = a.reply["angle"].as_f64() {
+            a.reply["angle"] = json!(180.0 - deg);
+        }
+    } else {
+        f.changed = true;
+    }
+}
+
+fn cross(a: Vec3, b: Vec3) -> Vec3 {
+    Vec3::new(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x)
+}
+
+fn minus(a: Vec3, b: Vec3) -> Vec3 {
+    Vec3::new(a.x - b.x, a.y - b.y, a.z - b.z)
+}
+
+/// Where two flat faces' planes meet, near the picks (`pt` on the target's, normal `nt`; `pm`, `nm`
+/// on the moving one's), and from there the way across that line into each face toward its pick:
+/// the rays the angle between the faces lies between. The dashed guides run out to the picks.
+/// None for parallel faces, which don't meet.
+fn faces_meet(pt: Vec3, nt: Vec3, pm: Vec3, nm: Vec3) -> Option<(Vec3, Vec3, Vec3, Vec<[Vec3; 2]>)> {
+    let l = cross(nt, nm);
+    let ll = dot(l, l);
+    if ll < 1e-6 {
+        return None;
+    }
+    let (da, db) = (dot(nt, pt), dot(nm, pm));
+    let on_both = along(along(Vec3::new(0.0, 0.0, 0.0), cross(nm, l), da / ll), cross(l, nt), db / ll);
+    let dir = unit(l)?;
+    let mid = along(pt, minus(pm, pt), 0.5);
+    let centre = along(on_both, dir, dot(dir, minus(mid, on_both)));
+    // Across the line, in the face, toward the pick (across the line in the face at all, when the
+    // pick is on the line).
+    let into = |p: Vec3, n: Vec3| {
+        let v = minus(p, centre);
+        let v = along(v, dir, -dot(dir, v));
+        let reach = dot(v, v).sqrt();
+        Some((unit(v).or_else(|| unit(cross(dir, n)))?, reach))
+    };
+    let ((rt, at), (rm, am)) = (into(pt, nt)?, into(pm, nm)?);
+    Some((centre, rt, rm, vec![[centre, along(centre, rt, at)], [centre, along(centre, rm, am)]]))
+}
+
+/// Where two lines (edges or axes: `pt` on the target's, direction `dt`; `pm`, `dm` on the moving
+/// one's) come nearest, and from there the way along each toward its pick. The dashed guides run
+/// out to the picks, and across the gap when the lines pass by each other. None for parallel lines.
+fn lines_meet(pt: Vec3, dt: Vec3, pm: Vec3, dm: Vec3) -> Option<(Vec3, Vec3, Vec3, Vec<[Vec3; 2]>)> {
+    let w = minus(pt, pm);
+    let (b, d, e) = (dot(dt, dm), dot(dt, w), dot(dm, w));
+    let den = 1.0 - b * b;
+    if den < 1e-6 {
+        return None;
+    }
+    let (s, t) = ((b * e - d) / den, (e - b * d) / den);
+    let (ct, cm) = (along(pt, dt, s), along(pm, dm, t));
+    let centre = along(ct, minus(cm, ct), 0.5);
+    let toward = |d: Vec3, k: f64| if k > 1e-9 { d } else { Vec3::new(-d.x, -d.y, -d.z) };
+    let mut guides = vec![[ct, pt], [cm, pm]];
+    if dot(minus(cm, ct), minus(cm, ct)) > 1e-12 {
+        guides.push([ct, cm]);
+    }
+    // The pick lies -s along the target's line from its nearest point, -t along the moving one's.
+    Some((centre, toward(dt, -s), toward(dm, -t), guides))
+}
+
+/// An angle's arcs as drawn: four rays from the centre (`ends`), the arc from each ray to the next
+/// (`arcs`, `sweeps` round) with its chip's place (`mids`), whether each measures the supplement of
+/// the angle between the directions, and dashed guides.
+struct Arcs {
+    centre: egui::Pos2,
+    ends: [egui::Pos2; 4],
+    arcs: [Vec<egui::Pos2>; 4],
+    mids: [egui::Pos2; 4],
+    sweeps: [f64; 4],
+    supplementary: [bool; 4],
+    guides: Vec<[egui::Pos2; 2]>,
+}
+
+/// The arcs between the picks themselves: from face to face about the line their planes meet on,
+/// or from edge to edge where the lines come nearest. None where they don't meet (parallel), or
+/// meet far from where the user is looking.
+fn between_picks(proj: &Proj, reply: &Value) -> Option<Arcs> {
+    let v = |a: &str, b: &str| {
+        let d = &reply[a][b];
+        Some(Vec3::new(d.get(0)?.as_f64()?, d.get(1)?.as_f64()?, d.get(2)?.as_f64()?))
+    };
+    let (dt, dm) = (unit(v("directions", "target")?)?, unit(v("directions", "moving")?)?);
+    let (pt, pm) = (v("origins", "target")?, v("origins", "moving")?);
+    let lines = reply["lines"].as_bool().unwrap_or(false);
+    let (centre, rt, rm, guides) = if lines { lines_meet(pt, dt, pm, dm)? } else { faces_meet(pt, dt, pm, dm)? };
+    let n = unit(cross(rt, rm))?;
+    let c = proj.to_screen(centre)?;
+    if proj.to_screen(pt).is_none_or(|p| (p - c).length() > 600.0) {
+        return None;
+    }
+    let pi = std::f64::consts::PI;
+    let alpha = dot(rt, rm).clamp(-1.0, 1.0).acos();
+    // The angle between the faces, as the rays run, is the one between the normals or its
+    // supplement: whichever it is nearer.
+    let theta = dot(dt, dm).clamp(-1.0, 1.0).acos();
+    let first = (alpha - theta).abs() > (alpha - (pi - theta)).abs() + 1e-9;
+    let screen_guides: Vec<[egui::Pos2; 2]> = guides.iter().filter_map(|[a, b]| Some([proj.to_screen(*a)?, proj.to_screen(*b)?])).collect();
+    let on_screen = |d: Vec3| proj.to_screen(along(centre, d, 1.0)).map_or(egui::Vec2::ZERO, |p| p - c);
+    let (a, b) = (on_screen(rt), on_screen(cross(n, rt)));
+    let per_mm = a.length().max(b.length());
+    if per_mm <= 1e-6 {
+        return None;
+    }
+    // Their plane seen nearly edge on, the arcs would be a line: flat on the screen there instead,
+    // the rays still running along the faces (or edges) as they are seen.
+    if (a.x * b.y - a.y * b.x).abs() / (per_mm * per_mm) < 0.3 {
+        return flat(proj, centre, rt, rm, first, screen_guides);
+    }
+    let r = f64::from(ARC_RADIUS / per_mm);
+    let neg = |v: Vec3| Vec3::new(-v.x, -v.y, -v.z);
+    let rays = [rt, rm, neg(rt), neg(rm)];
+    let sweeps = [alpha, pi - alpha, alpha, pi - alpha];
+    let supplementary = [first, !first, first, !first];
+    let at = |i: usize, a: f64, k: f64| {
+        let d = rays.get(i).copied().unwrap_or(rt);
+        proj.to_screen(along(along(centre, d, k * a.cos()), cross(n, d), k * a.sin()))
+    };
+    let mut arcs: [Vec<egui::Pos2>; 4] = Default::default();
+    let mut mids = [c; 4];
+    let mut ends = [c; 4];
+    for i in 0..4 {
+        let sweep = sweeps.get(i).copied().unwrap_or(0.0);
+        if let Some(arc) = arcs.get_mut(i) {
+            *arc = (0..=32).filter_map(|k| at(i, sweep * f64::from(k) / 32.0, r)).collect();
+        }
+        if let (Some(m), Some(p)) = (mids.get_mut(i), at(i, sweep / 2.0, r)) {
+            *m = p;
+        }
+        if let (Some(e), Some(p)) = (ends.get_mut(i), at(i, 0.0, r * 1.35)) {
+            *e = p;
+        }
+    }
+    Some(Arcs { centre: c, ends, arcs, mids, sweeps, supplementary, guides: screen_guides })
+}
+
+/// The arcs at the target pick, flat on the screen: where the picks don't meet (parallel) or meet
+/// far off. Between the directions: the normals, or the edges' or axes' directions.
+fn at_pick(proj: &Proj, reply: &Value, at: Vec3) -> Option<Arcs> {
+    let dir = |k: &str| {
+        let d = &reply["directions"][k];
+        unit(Vec3::new(d.get(0)?.as_f64()?, d.get(1)?.as_f64()?, d.get(2)?.as_f64()?))
+    };
+    flat(proj, at, dir("target")?, dir("moving")?, false, Vec::new())
+}
+
+/// Arcs flat on the screen at `at`, between rays `dt` and `dm`: `dt` runs as it does on screen (up
+/// when it points at the eye), `dm` on the side it is on, the angles at their true size. The first
+/// arc measures the supplement when `first`.
+fn flat(proj: &Proj, at: Vec3, dt: Vec3, dm: Vec3, first: bool, guides: Vec<[egui::Pos2; 2]>) -> Option<Arcs> {
+    let origin = proj.to_screen(at)?;
+    let on_screen = |d: Vec3| proj.to_screen(along(at, d, 1.0)).map(|p| p - origin).filter(|v| v.length() > 1e-4);
+    let lead = on_screen(dt).map_or(egui::vec2(0.0, -1.0), egui::Vec2::normalized);
+    let sense = on_screen(dm).map(|v| lead.x * v.y - lead.y * v.x).filter(|c| c.abs() > 1e-4).map_or(1.0, f32::signum);
+    let base = f64::from(lead.y).atan2(f64::from(lead.x));
+    let theta = dot(dt, dm).clamp(-1.0, 1.0).acos();
+    let pi = std::f64::consts::PI;
+    let starts = [0.0, theta, pi, pi + theta];
+    let sweeps = [theta, pi - theta, theta, pi - theta];
+    let toward = |a: f64, k: f32| {
+        let a = base + f64::from(sense) * a;
+        origin + egui::vec2(a.cos() as f32, a.sin() as f32) * k
+    };
+    let arcs = std::array::from_fn(|i| {
+        let (s, w) = (starts.get(i).copied().unwrap_or(0.0), sweeps.get(i).copied().unwrap_or(0.0));
+        (0..=32).map(|k| toward(s + w * f64::from(k) / 32.0, ARC_RADIUS)).collect()
+    });
+    let mids = std::array::from_fn(|i| toward(starts.get(i).copied().unwrap_or(0.0) + sweeps.get(i).copied().unwrap_or(0.0) / 2.0, ARC_RADIUS));
+    let ends = std::array::from_fn(|i| toward(starts.get(i).copied().unwrap_or(0.0), ARC_RADIUS * 1.35));
+    Some(Arcs { centre: origin, ends, arcs, mids, sweeps, supplementary: [first, !first, first, !first], guides })
+}
+
+/// The angle measured, drawn between the picks themselves (`between_picks`: from face to face, or
+/// edge to edge), or flat at the target pick where they don't meet (`at_pick`): the two rays the
+/// angle lies between and their reverses, and the four angles between them as arcs. The one
+/// measured is a solid arrow; the others are faint, each with its value on a chip that measures
+/// that one instead.
+fn angle_arcs(painter: &egui::Painter, proj: &Proj, f: &mut MateForm, shown: &Applied, at: Vec3) {
+    let Some(arcs) = between_picks(proj, &shown.reply).or_else(|| at_pick(proj, &shown.reply, at)) else { return };
+    let reverse = shown.reply["reverse"].as_bool().unwrap_or(false);
+    let measures = |i: &usize| arcs.supplementary.get(*i) == Some(&reverse);
+    let chosen = f.sector.filter(measures).or_else(|| (0..4).find(measures)).unwrap_or(0);
+    let t = solidcraft_theme::Tokens::get();
+    let faint = t.text_dim.gamma_multiply(0.55);
+    for [a, b] in &arcs.guides {
+        painter.add(egui::Shape::dashed_line(&[*a, *b], egui::Stroke::new(1.0, t.text_dim), 4.0, 3.0));
+    }
+    for (i, end) in arcs.ends.iter().enumerate() {
+        painter.line_segment([arcs.centre, *end], egui::Stroke::new(1.0, if i < 2 { t.text_dim } else { faint }));
+    }
+    let ctx = painter.ctx().clone();
+    for (i, ((pts, sweep), mid)) in arcs.arcs.iter().zip(arcs.sweeps).zip(arcs.mids).enumerate() {
+        let on = i == chosen;
+        // Parallel directions: no arc to draw, but the angle measured is still shown (0 degrees).
+        let flat = sweep < 1e-3;
+        if flat && !on {
+            continue;
+        }
+        let stroke = egui::Stroke::new(if on { 2.0 } else { 1.2 }, if on { t.accent } else { faint });
+        if !flat {
+            painter.add(egui::Shape::line(pts.clone(), stroke));
+            // An arrowhead at each end: the angle runs from one ray to the other.
+            let n_pts = pts.len();
+            for (tip, from) in [(pts.first(), pts.get(1)), (pts.last(), n_pts.checked_sub(2).and_then(|k| pts.get(k)))] {
+                if let (Some(tip), Some(from)) = (tip, from) {
+                    let back = (*from - *tip).normalized() * if on { 9.0 } else { 7.0 };
+                    let wing = egui::vec2(-back.y, back.x) * 0.45;
+                    painter.add(egui::Shape::convex_polygon(vec![*tip, *tip + back + wing, *tip + back - wing], stroke.color, egui::Stroke::NONE));
+                }
+            }
+        }
+        // Its value on a chip beyond the arc's middle: a click measures this one.
+        let out = (mid - arcs.centre).normalized() * 16.0;
+        let label = format!("{}°", crate::dialogs_coupling::trim((sweep.to_degrees() * 10.0).round() / 10.0));
+        let handle = format!("mate:arc:{i}");
+        let clicked = Container::new(&ctx, Surface::Canvas)
+            .area(egui::Id::unique(("sc_mate_arc", i)))
+            .pivot(egui::Align2::CENTER_CENTER)
+            .fixed_pos(mid + out)
+            .order(egui::Order::Foreground)
+            .show(&ctx, |ui| {
+                // One line: a chip near the pill or the window's edge has little room, and a wrapped
+                // value ("6" over "0°") reads as two.
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                let r = crate::ui_kit::button(ui, &label, if on { crate::ui_kit::Button::SmallSelected } else { crate::ui_kit::Button::Small });
+                crate::scenario::publish_handle(&handle, r.rect.center());
+                r.clicked()
+            })
+            .inner;
+        if clicked && !on {
+            measure_on(f, i, arcs.supplementary.get(i).copied().unwrap_or(false), reverse);
+        }
+    }
 }
 
 /// The pill beside the mate shown: its rule, its value, and the switches that fit it.
@@ -561,21 +945,33 @@ pub fn overlay(app: &SolveApp, painter: &egui::Painter, proj: &Proj, f: &mut Mat
     let Some(anchor) = picked_snap(app, &shown.picks[1]).map(|s| s.at) else { return };
     let Some(screen) = proj.to_screen(anchor) else { return };
     let rule = shown.reply["rule"].as_str().unwrap_or_default().to_string();
-    let kind = shown.reply["kind"].as_str().unwrap_or_default().to_string();
-    let faces = shown.picks.iter().all(|p| matches!(p, Sel::Face { .. }));
+    let choices: Vec<String> = shown.reply["choices"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(str::to_string)).collect();
     let ctx = painter.ctx().clone();
     let t = solidcraft_theme::Tokens::get();
-    let at = screen + egui::vec2(18.0, -18.0);
+    // An angle draws its arcs round the pick: the pill sits clear of them.
+    let at = if rule == "angle" {
+        angle_arcs(painter, proj, f, &shown, anchor);
+        screen + egui::vec2(ARC_RADIUS + 40.0, -ARC_RADIUS - 24.0)
+    } else {
+        screen + egui::vec2(18.0, -18.0)
+    };
     Container::new(&ctx, Surface::Canvas).area(egui::Id::unique("sc_mate_pill")).fixed_pos(at).order(egui::Order::Foreground).show(&ctx, |ui| {
         let frame = Container::popup_frame(ui.style()).inner_margin(egui::Margin::symmetric(6, 3));
         Container::show_backing(ui, frame, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(rule_label(&rule)).color(t.text_dim).size(t.font_caption));
-                let planes = matches!(rule.as_str(), "mate" | "flush" | "angle") || (rule == "parallel" && f.mode == Mode::Auto && !faces);
+                // The relationship made, by name, and the others the picks take. The name is
+                // centred on the buttons' height: a caption on its own sits on the row's top.
+                let name = egui::RichText::new(rule_label(&rule)).color(t.text_dim).size(t.font_caption);
+                let width =
+                    ui.painter().layout_no_wrap(rule_label(&rule).to_string(), egui::FontId::proportional(t.font_caption), t.text_dim).size().x;
+                let r = ui.add_sized(egui::vec2(width, t.control_height), egui::Label::new(name).selectable(false));
+                crate::scenario::publish_rect("mate:rule_name", r.rect);
+                rule_buttons(ui, f, &choices, &rule);
+                let angular = rule == "angle";
                 let valued =
                     matches!(rule.as_str(), "mate" | "flush" | "angle" | "tangent" | "line_on_plane" | "point_on_plane" | "point_on_cylinder");
                 if valued && !(f.limits && limitable(f)) {
-                    let value = if f.mode == Mode::Angle { &mut f.angle } else { &mut f.distance };
+                    let value = if angular { &mut f.angle } else { &mut f.distance };
                     let id = egui::Id::unique("sc_mate_value");
                     let r = crate::ui_kit::canvas_value_field(ui, id, value, false, "");
                     crate::scenario::publish_handle("mate:value", r.rect.center());
@@ -590,41 +986,24 @@ pub fn overlay(app: &SolveApp, painter: &egui::Painter, proj: &Proj, f: &mut Mat
                     }
                     if r.changed() {
                         f.changed = true;
+                        f.angle_set |= angular;
                     }
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         f.done = true;
                     }
                 }
-                if planes || rule == "angle" {
-                    if icon_toggle(ui, "constraint_angle", solidcraft_ui_text::tr("mate.angle"), f.mode == Mode::Angle, "mate:angle") {
-                        f.mode = if f.mode == Mode::Angle { Mode::Auto } else { Mode::Angle };
-                        f.changed = true;
-                        f.focus = true;
-                    }
-                    if icon_toggle(ui, "reverse_normal", solidcraft_ui_text::tr("mate.flip"), f.flip, "mate:flip") {
-                        f.flip = !f.flip;
-                        f.changed = true;
-                    }
-                }
-                // Two cylinders, or a straight edge and a cylinder: on one axis or side by side.
-                let axial = matches!(rule.as_str(), "concentric") && (faces || f.mode == Mode::Axial);
-                if axial && icon_toggle(ui, "constraint_tangent", solidcraft_ui_text::tr("mate.tangent"), false, "mate:tangent") {
-                    f.mode = if faces { Mode::Tangent } else { Mode::Auto };
-                    f.changed = true;
-                    f.focus = true;
-                }
-                if kind == "line_on_cylinder" && icon_toggle(ui, "constraint_concentric", solidcraft_ui_text::tr("mate.axial"), false, "mate:axial") {
-                    f.mode = if faces { Mode::Auto } else { Mode::Axial };
+                // Turned over: two faces flush, an axis end for end. (An angle picks the angle it
+                // measures on its arcs instead.)
+                if matches!(rule.as_str(), "mate" | "flush" | "parallel" | "insert")
+                    && icon_toggle(ui, "reverse_normal", solidcraft_ui_text::tr("mate.flip"), f.flip, "mate:flip")
+                {
+                    f.flip = !f.flip;
                     f.changed = true;
                 }
                 if matches!(rule.as_str(), "concentric" | "insert")
                     && icon_toggle(ui, "c_fix", solidcraft_ui_text::tr("mate.lock"), f.lock, "mate:lock")
                 {
                     f.lock = !f.lock;
-                    f.changed = true;
-                }
-                if rule == "insert" && icon_toggle(ui, "reverse_normal", solidcraft_ui_text::tr("mate.flip"), f.flip, "mate:flip") {
-                    f.flip = !f.flip;
                     f.changed = true;
                 }
                 if toggle(ui, solidcraft_ui_text::tr("mate.done"), false, "mate:done") {
@@ -672,6 +1051,11 @@ pub fn take_back(d: &mut crate::dialogs::Dialog) -> bool {
     }
 }
 
+/// The Mate tool shows a mate: made, or sliding into place.
+pub fn showing(app: &SolveApp) -> bool {
+    app.dialog.as_ref().is_some_and(|d| matches!(&d.kind, crate::dialogs::Kind::Assembly(Asm::Mate(f)) if f.applied.is_some() || f.slide.is_some()))
+}
+
 /// The Mate tool is open.
 pub fn open(app: &SolveApp) -> bool {
     app.dialog.as_ref().is_some_and(|d| matches!(&d.kind, crate::dialogs::Kind::Assembly(Asm::Mate(_))))
@@ -710,6 +1094,141 @@ mod tests {
         h.frames(1);
         assert!(!open(&h.app), "the next Esc closes the tool");
         assert_eq!(h.app.session.undo.len(), undo);
+    }
+
+    /// The pill's rules: two cylinders on one axis as the picks suggest, side by side when tangent is
+    /// picked, and back on the axis when the suggested one is. Each is made from where the roller
+    /// was before the second pick, so back on the axis is exactly where the first mate put it, and
+    /// the shown mate stays one undo step.
+    #[test]
+    fn a_rule_picked_on_the_pill_is_made_from_where_the_part_was() {
+        use solidcraft_engine::doc::joints::JointKind;
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.preferences.animate_mates = false;
+        let run = |h: &mut crate::scenario::Harness, id: &str, p: Value| h.app.run(id, p).unwrap();
+        run(&mut h, "component.create", json!({"name": "Shaft"}));
+        run(&mut h, "solid.cylinder", json!({"base": [0, 0, 0], "axis": [0, 0, 1], "radius": 5, "height": 40, "operation": "new"}));
+        run(&mut h, "component.activate", json!({"component": "root"}));
+        run(&mut h, "component.create", json!({"name": "Roller"}));
+        run(&mut h, "solid.cylinder", json!({"base": [60, 30, 10], "axis": [0, 1, 0], "radius": 8, "height": 20, "operation": "new"}));
+        run(&mut h, "component.activate", json!({"component": "root"}));
+        let shaft = h.app.session.doc.find_component("Shaft").and_then(|c| h.app.session.doc.occurrence_of(c)).map(|o| o.id).unwrap();
+        run(&mut h, "occurrence.ground", json!({"occurrence": shaft, "grounded": true}));
+        let roller = h.app.session.doc.find_component("Roller").and_then(|c| h.app.session.doc.occurrence_of(c)).map(|o| o.id).unwrap();
+        let placed = |h: &crate::scenario::Harness| h.app.session.doc.occurrences.iter().find(|o| o.id == roller).map(|o| o.transform).unwrap();
+        let undo = h.app.session.undo.len();
+        h.app.start("assembly.mate");
+        let (a, b) = (
+            crate::dialogs::face_sel(&h.app.session, Vec3::new(68.0, 40.0, 10.0)).unwrap(),
+            crate::dialogs::face_sel(&h.app.session, Vec3::new(5.0, 0.0, 20.0)).unwrap(),
+        );
+        if let Some(d) = h.app.dialog.as_mut() {
+            d.inputs[0].items = vec![a];
+            d.inputs[1].items = vec![b];
+        }
+        h.frames(3);
+        let kinds = |h: &crate::scenario::Harness| h.app.session.doc.assembly.joints.iter().map(|j| j.kind).collect::<Vec<_>>();
+        assert_eq!(kinds(&h), vec![JointKind::Cylindrical], "on one axis, as the picks suggest");
+        // The pill names it, centred on its buttons' height.
+        let name = crate::scenario::rect_of("mate:rule_name").expect("the pill names the rule");
+        let button = crate::scenario::rect_of("mate:rule:concentric").expect("a button for each rule");
+        assert!((name.center().y - button.center().y).abs() < 0.5, "{name:?} vs {button:?}");
+        let on_axis = placed(&h);
+        let pick = |h: &mut crate::scenario::Harness, rule: Option<&str>| {
+            if let Some(crate::dialogs::Kind::Assembly(Asm::Mate(f))) = h.app.dialog.as_mut().map(|d| &mut d.kind) {
+                f.rule = rule.map(str::to_string);
+                f.changed = true;
+            }
+            h.frames(3);
+        };
+        pick(&mut h, Some("tangent"));
+        assert_eq!(kinds(&h), vec![JointKind::LineOnCylinder], "side by side");
+        assert_ne!(placed(&h), on_axis);
+        assert_eq!(h.app.session.undo.len(), undo + 1, "still one step");
+        pick(&mut h, None);
+        assert_eq!(kinds(&h), vec![JointKind::Cylindrical], "back on the axis");
+        for (x, y) in placed(&h).iter().flatten().zip(on_axis.iter().flatten()) {
+            assert!((x - y).abs() < 1e-9, "where the first mate put it: {:?} vs {on_axis:?}", placed(&h));
+        }
+        assert_eq!(h.app.session.undo.len(), undo + 1, "still one step");
+    }
+
+    /// Measuring an angle on the other side (a faint arc's chip) changes what its value means, not
+    /// the mate: 60 degrees between two tops' normals is 120 measured against one reversed. The
+    /// joint stays exactly as it is, tipped the same way; two tops facing the same way could tip
+    /// either way just as near, were it made again.
+    #[test]
+    fn measuring_an_angle_the_other_way_leaves_the_part_where_it_is() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.preferences.animate_mates = false;
+        crate::test_support::grounded_boxes(&[("A", 0), ("B", 30)], |id, p| h.app.run(id, p).unwrap());
+        h.app.start("assembly.mate");
+        let (b, a) = (
+            crate::dialogs::face_sel(&h.app.session, Vec3::new(40.0, 10.0, 10.0)).unwrap(),
+            crate::dialogs::face_sel(&h.app.session, Vec3::new(10.0, 10.0, 10.0)).unwrap(),
+        );
+        if let Some(d) = h.app.dialog.as_mut() {
+            d.inputs[0].items = vec![b];
+            d.inputs[1].items = vec![a];
+        }
+        h.frames(3);
+        let form = |h: &mut crate::scenario::Harness, set: &dyn Fn(&mut MateForm)| {
+            if let Some(crate::dialogs::Kind::Assembly(Asm::Mate(f))) = h.app.dialog.as_mut().map(|d| &mut d.kind) {
+                set(f);
+            }
+            h.frames(3);
+        };
+        form(&mut h, &|f| {
+            f.rule = Some("angle".into());
+            f.changed = true;
+        });
+        form(&mut h, &|f| {
+            f.angle = "60 deg".into();
+            f.angle_set = true;
+            f.changed = true;
+        });
+        let joint = |h: &crate::scenario::Harness| h.app.session.doc.assembly.joints.last().cloned().unwrap();
+        let (before, undo) = (joint(&h), h.app.session.undo.len());
+        assert_eq!(before.kind, solidcraft_engine::doc::joints::JointKind::Angle);
+        form(&mut h, &|f| measure_on(f, 1, true, false));
+        let after = joint(&h);
+        assert_eq!((after.id, after.angle, after.values.clone()), (before.id, before.angle, before.values.clone()), "the same joint, as it was");
+        assert_eq!(h.app.session.undo.len(), undo, "nothing made again");
+        if let Some(crate::dialogs::Kind::Assembly(Asm::Mate(f))) = h.app.dialog.as_ref().map(|d| &d.kind) {
+            assert_eq!(f.angle, "120 deg");
+            let shown = f.applied.as_ref().unwrap();
+            assert_eq!((shown.params["reverse"].as_bool(), shown.reply["reverse"].as_bool()), (Some(true), Some(true)));
+        }
+        // While the mate is shown no joint glyph is drawn round its arcs; kept (Done), it has its own.
+        assert!(crate::dialogs_assembly::drawn_joints(&h.app).is_empty(), "no joint glyphs while the mate is shown");
+        h.app.set_origin_shown(true);
+        assert!(!h.app.origin_visible(), "nor the origin's planes and axes");
+        form(&mut h, &|f| f.done = true);
+        assert_eq!(crate::dialogs_assembly::drawn_joints(&h.app), vec![(after.id, false)], "the mate kept draws its glyph");
+        assert!(h.app.origin_visible(), "and the origin is back");
+    }
+
+    /// An angle's arcs run between the picks: two faces' from where their planes meet, out into each
+    /// face toward its pick; two lines' from where they come nearest, along each toward its pick,
+    /// with the gap between lines that pass each other shown.
+    #[test]
+    fn angle_arcs_run_from_face_to_face_and_edge_to_edge() {
+        let near = |a: Vec3, b: Vec3| (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9 && (a.z - b.z).abs() < 1e-9;
+        // A plate's top (z = 10) and a block's side (x = 30, facing -x) meet on x = 30, z = 10.
+        let (top, side) = (Vec3::new(5.0, 5.0, 10.0), Vec3::new(30.0, 45.0, 60.0));
+        let (centre, rt, rm, guides) = faces_meet(top, Vec3::new(0.0, 0.0, 1.0), side, Vec3::new(-1.0, 0.0, 0.0)).expect("they meet");
+        assert!(near(centre, Vec3::new(30.0, 25.0, 10.0)), "{centre:?}: on the line, beside the picks");
+        assert!(near(rt, Vec3::new(-1.0, 0.0, 0.0)) && near(rm, Vec3::new(0.0, 0.0, 1.0)), "{rt:?} {rm:?}: into each face");
+        assert_eq!(guides.len(), 2);
+        assert!(faces_meet(top, Vec3::new(0.0, 0.0, 1.0), side, Vec3::new(0.0, 0.0, -1.0)).is_none(), "parallel faces don't meet");
+        // A line along x through the origin and one along y through (5, 3, 4) pass 4 apart at x = 5.
+        let (centre, rt, rm, guides) =
+            lines_meet(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(5.0, 3.0, 4.0), Vec3::new(0.0, 1.0, 0.0)).expect("they cross");
+        assert!(near(centre, Vec3::new(5.0, 0.0, 2.0)), "{centre:?}");
+        assert!(near(rt, Vec3::new(-1.0, 0.0, 0.0)) && near(rm, Vec3::new(0.0, 1.0, 0.0)), "{rt:?} {rm:?}: toward each pick");
+        assert_eq!(guides.len(), 3, "out to each pick, and across the gap");
     }
 
     /// Each frame of the slide is a placement `occurrence.move` takes, and puts the part there.

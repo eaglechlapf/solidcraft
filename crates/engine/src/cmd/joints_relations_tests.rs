@@ -1203,8 +1203,9 @@ fn mate_lines_up_two_cylinders_or_rests_them_side_by_side() {
     assert!(d.x.abs() < 1e-6 && d.y.abs() < 1e-6, "{d:?}");
 }
 
-/// An angle between two flat faces may take limits instead of one angle: the part swings
-/// between them, and starts at the nearest (here the most, from a side standing square).
+/// An angle between two flat faces may take limits instead of one angle, measured as the angle is
+/// (between the normals, or with `reverse` its supplement): the part swings between them, and
+/// starts at the nearest.
 #[test]
 fn mate_with_angle_limits_lets_the_faces_swing_between_them() {
     let mut s = plate_and_free_block();
@@ -1213,19 +1214,157 @@ fn mate_with_angle_limits_lets_the_faces_swing_between_them() {
     let r = mate(&mut s, side.clone(), top.clone(), json!({"mode": "angle", "limits": ["10 deg", "30 deg"]}));
     assert!(clean(&r), "{r}");
     assert_eq!((r["rule"].as_str(), r["kind"].as_str()), (Some("angle"), Some("angle_range")), "{r}");
-    // The side's outward normal (-x on the block) is 30 degrees off mated: 150 from the top's.
+    // The side's outward normal (-x on the block) stood square to the top's: 30 degrees from it now.
     let n = place(&s, "Block", Vec3::new(29.0, 45.0, 60.0)) - place(&s, "Block", Vec3::new(30.0, 45.0, 60.0));
-    assert!((n.dot(Vec3::Z) - 150f64.to_radians().cos()).abs() < 1e-6, "{n:?}");
-    // A face turned right away from the other (a half turn off mated) starts at the most.
+    assert!((n.dot(Vec3::Z) - 30f64.to_radians().cos()).abs() < 1e-6, "{n:?}");
+    // The block's top faces the way the plate's does: 0 between the normals, 180 reversed. Between
+    // 0 and 90 reversed, it starts at 90 (the nearest), turned a quarter turn, not a half one.
     let mut s = plate_and_free_block();
     let block_top = json!({"occurrence": "Block", "face": [31, 41, 70]});
-    let r = mate(&mut s, block_top, top.clone(), json!({"mode": "angle", "limits": ["0 deg", "90 deg"]}));
+    let r = mate(&mut s, block_top, top.clone(), json!({"mode": "angle", "reverse": true, "limits": ["0 deg", "90 deg"]}));
     assert!(clean(&r), "{r}");
     let n = place(&s, "Block", Vec3::new(31.0, 41.0, 71.0)) - place(&s, "Block", Vec3::new(31.0, 41.0, 70.0));
-    assert!(n.dot(Vec3::Z).abs() < 1e-6, "90 degrees off mated: the top stands square to the plate's: {n:?}");
+    assert!(n.dot(Vec3::Z).abs() < 1e-6, "the top stands square to the plate's: {n:?}");
     let p = json!({"a": side, "b": top, "mode": "angle", "limits": ["30 deg", "10 deg"]});
     let e = s.execute("assembly.mate", &p).expect_err("min above max").to_string();
     assert!(e.contains("min no larger than max"), "{e}");
+}
+
+/// The reply lists the rules two picks take, the one they suggest first, and `rule` makes another
+/// from where the parts are, moving the part no further than it needs: two flat faces parallel
+/// stay where they are, and an angle not given is the one the faces are at.
+#[test]
+fn mate_lists_the_rules_the_picks_take_and_makes_the_one_asked() {
+    let corner = Vec3::new(30.0, 40.0, 50.0);
+    let block_bottom = json!({"occurrence": "Block", "face": [31, 41, 50]});
+    let side = json!({"occurrence": "Block", "face": [30, 45, 60]});
+    let top = json!({"occurrence": "Plate", "face": [5, 5, 10]});
+    let mut s = plate_and_free_block();
+    let r = mate(&mut s, block_bottom.clone(), top.clone(), json!({}));
+    assert_eq!(r["choices"], json!(["mate", "angle", "parallel"]), "{r}");
+    assert_eq!(r["rule"], "mate", "{r}");
+    // Parallel already: nothing moves.
+    let mut s = plate_and_free_block();
+    let r = mate(&mut s, block_bottom.clone(), top.clone(), json!({"rule": "parallel"}));
+    assert!(clean(&r), "{r}");
+    assert_eq!((r["rule"].as_str(), r["kind"].as_str()), (Some("parallel"), Some("parallel")), "{r}");
+    assert!((place(&s, "Block", corner) - corner).len() < 1e-6, "{:?}", place(&s, "Block", corner));
+    // At an angle not given: the 90 degrees between the normals the side is at, and nothing moves.
+    let mut s = plate_and_free_block();
+    let r = mate(&mut s, side.clone(), top.clone(), json!({"rule": "angle"}));
+    assert!(clean(&r), "{r}");
+    assert_eq!((r["rule"].as_str(), r["reverse"].as_bool()), (Some("angle"), Some(false)), "{r}");
+    let deg = r["angle"].as_f64().unwrap_or(f64::NAN);
+    assert!((deg - 90.0).abs() < 1e-6, "{r}");
+    assert!((place(&s, "Block", corner) - corner).len() < 1e-6, "{:?}", place(&s, "Block", corner));
+    // The directions it is measured between, where the parts are: the top's normal, the side's.
+    assert_eq!(r["directions"]["target"], json!([0.0, 0.0, 1.0]), "{r}");
+    let moving = &r["directions"]["moving"];
+    assert!((moving[0].as_f64().unwrap_or(0.0) + 1.0).abs() < 1e-9, "{r}");
+    // And a point on each: on the plate's top, on the block's side.
+    assert!((r["origins"]["target"][2].as_f64().unwrap_or(0.0) - 10.0).abs() < 1e-9, "{r}");
+    assert!((r["origins"]["moving"][0].as_f64().unwrap_or(0.0) - 30.0).abs() < 1e-9, "{r}");
+    assert_eq!(r["lines"], false, "{r}");
+    // A rule the picks don't take is refused, naming the ones they do.
+    let p = json!({"a": side, "b": top, "rule": "concentric"});
+    let e = s.execute("assembly.mate", &p).expect_err("two faces aren't on an axis").to_string();
+    assert!(e.contains("mate, angle, parallel"), "{e}");
+    // Two cylinders: one axis first, side by side by asking.
+    let mut s = Session::default();
+    run(&mut s, "component.create", json!({"name": "Shaft"}));
+    run(&mut s, "solid.cylinder", json!({"base": [0, 0, 0], "axis": [0, 0, 1], "radius": 5, "height": 40, "operation": "new"}));
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    run(&mut s, "component.create", json!({"name": "Roller"}));
+    run(&mut s, "solid.cylinder", json!({"base": [60, 30, 10], "axis": [0, 1, 0], "radius": 8, "height": 20, "operation": "new"}));
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    let shaft = occ(&s, "Shaft");
+    run(&mut s, "occurrence.ground", json!({"occurrence": shaft, "grounded": true}));
+    let r = mate(
+        &mut s,
+        json!({"occurrence": "Roller", "face": [68, 40, 10]}),
+        json!({"occurrence": "Shaft", "face": [5, 0, 20]}),
+        json!({"rule": "tangent"}),
+    );
+    assert!(clean(&r), "{r}");
+    assert_eq!(r["choices"], json!(["concentric", "tangent", "angle", "parallel"]), "{r}");
+    assert_eq!((r["rule"].as_str(), r["kind"].as_str()), (Some("tangent"), Some("line_on_cylinder")), "{r}");
+}
+
+/// An angle between two faces is measured between their normals: the block's bottom, lying on
+/// the plate's top (its normal against the top's), tilted to 150 degrees between the normals is 30
+/// degrees off the plate; measured reversed, 30 degrees is the same lean. Between two straight
+/// edges the angle is the one at most a right angle, unless reversed.
+#[test]
+fn mate_measures_an_angle_between_normals_or_directions() {
+    let bottom = json!({"occurrence": "Block", "face": [31, 41, 50]});
+    let top = json!({"occurrence": "Plate", "face": [5, 5, 10]});
+    // The bottom's outward normal, as a lean from straight down.
+    let lean = |s: &Session| {
+        let n = place(s, "Block", Vec3::new(31.0, 41.0, 49.0)) - place(s, "Block", Vec3::new(31.0, 41.0, 50.0));
+        n.dot(-Vec3::Z).clamp(-1.0, 1.0).acos().to_degrees()
+    };
+    let mut s = plate_and_free_block();
+    let r = mate(&mut s, bottom.clone(), top.clone(), json!({"rule": "angle"}));
+    assert!((r["angle"].as_f64().unwrap_or(0.0) - 180.0).abs() < 1e-6, "lying flat: 180 between the normals: {r}");
+    let mut s = plate_and_free_block();
+    let r = mate(&mut s, bottom.clone(), top.clone(), json!({"rule": "angle", "angle": "150 deg"}));
+    assert!(clean(&r), "{r}");
+    assert!((lean(&s) - 30.0).abs() < 1e-6, "{}", lean(&s));
+    let mut s = plate_and_free_block();
+    let r = mate(&mut s, bottom, top, json!({"rule": "angle", "angle": "30 deg", "reverse": true}));
+    assert!(clean(&r), "{r}");
+    assert!((lean(&s) - 30.0).abs() < 1e-6, "{}", lean(&s));
+    // Faces that face the same way (the block's top, the plate's top): 60 between the normals and
+    // 120 measured reversed are one placement, so measuring the other way leaves the part be.
+    let top_block = json!({"occurrence": "Block", "face": [31, 41, 70]});
+    let top_plate = json!({"occurrence": "Plate", "face": [5, 5, 10]});
+    let placed = |extra: Value| {
+        let mut s = plate_and_free_block();
+        let r = mate(&mut s, top_block.clone(), top_plate.clone(), extra);
+        assert!(clean(&r), "{r}");
+        [place(&s, "Block", Vec3::new(30.0, 40.0, 50.0)), place(&s, "Block", Vec3::new(50.0, 60.0, 70.0))]
+    };
+    let (a, b) = (placed(json!({"rule": "angle", "angle": "60 deg"})), placed(json!({"rule": "angle", "angle": "120 deg", "reverse": true})));
+    for (p, q) in a.iter().zip(&b) {
+        assert!((*p - *q).len() < 1e-6, "{a:?} vs {b:?}");
+    }
+    // Two straight edges at a right angle across each other's ends: 90 either way; the block's
+    // edge along y and the plate's along x, at 90 to begin with.
+    let mut s = plate_and_free_block();
+    let along_y = json!({"occurrence": "Block", "edge": [30, 50, 50]});
+    let along_x = json!({"occurrence": "Plate", "edge": [50, 0, 10]});
+    let r = mate(&mut s, along_y.clone(), along_x.clone(), json!({}));
+    assert!(r["choices"].as_array().is_some_and(|c| c.contains(&json!("angle"))), "{r}");
+    let mut s = plate_and_free_block();
+    let r = mate(&mut s, along_y, along_x, json!({"rule": "angle", "angle": "60 deg"}));
+    assert!(clean(&r), "{r}");
+    assert_eq!(r["reverse"].as_bool(), Some(false), "90 to begin with is at most a right angle: {r}");
+    let d = place(&s, "Block", Vec3::new(30.0, 60.0, 50.0)) - place(&s, "Block", Vec3::new(30.0, 40.0, 50.0));
+    let cos = (d.x / d.len()).abs();
+    assert!((cos - 60f64.to_radians().cos()).abs() < 1e-6, "{d:?}");
+}
+
+/// A pin standing beside a hole, mated side by side with the hole's wall, keeps the way it stands
+/// and its height: it moves across to the wall and no further (it is not turned end for end about
+/// the pick, which would stand it up out of the hole).
+#[test]
+fn mate_rests_a_pin_on_a_holes_wall_where_it_stands() {
+    let mut s = plate_and_free_block();
+    run(&mut s, "component.activate", json!({"component": "Plate"}));
+    run(&mut s, "solid.cylinder", json!({"base": [70, 70, 0], "axis": [0, 0, 1], "radius": 8, "height": 10, "operation": "cut"}));
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    run(&mut s, "component.create", json!({"name": "Pin"}));
+    run(&mut s, "solid.cylinder", json!({"base": [20, 20, 40], "axis": [0, 0, 1], "radius": 4, "height": 30, "operation": "new"}));
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    let pin = json!({"occurrence": "Pin", "face": [24, 20, 55]});
+    let hole = json!({"occurrence": "Plate", "face": [78, 70, 5]});
+    let r = mate(&mut s, pin, hole, json!({"rule": "tangent"}));
+    assert!(clean(&r), "{r}");
+    assert_eq!(r["kind"], "line_on_cylinder", "{r}");
+    let (foot, head) = (place(&s, "Pin", Vec3::new(20.0, 20.0, 40.0)), place(&s, "Pin", Vec3::new(20.0, 20.0, 70.0)));
+    assert!((foot.z - 40.0).abs() < 1e-6 && (head.z - 70.0).abs() < 1e-6, "{foot:?} {head:?}");
+    // Its axis 4 mm (8 - 4) from the hole's: against the wall inside it.
+    assert!(((foot.x - 70.0).hypot(foot.y - 70.0) - 4.0).abs() < 1e-6, "{foot:?}");
 }
 
 /// A pin's end rim past its rounded edge has no cylinder beside it: it still sits on a hole's rim,

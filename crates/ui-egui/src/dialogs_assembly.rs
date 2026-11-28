@@ -4198,11 +4198,13 @@ pub fn joint_frames_world(s: &Session) -> Vec<(u64, solidcraft_engine::doc::Mat)
 
 /// The joints whose glyph the viewport draws, and whether each is highlighted. A hidden joint
 /// isn't drawn (it still constrains and moves the parts), except while it is picked in the
-/// browser: then it shows highlighted until the pick goes away.
+/// browser: then it shows highlighted until the pick goes away. While the Mate tool shows a mate,
+/// only picked joints are drawn: its pill and arcs say what the mate is, and other joints' rings
+/// and axes around them would make those hard to read.
 pub fn drawn_joints(app: &SolveApp) -> Vec<(u64, bool)> {
     // `Session::joint_drawn` for each joint, with the Joints folder looked up once: it was looked
     // up again for every joint of the design at every frame.
-    let folder_shown = !app.session.folder_hidden("c0/joints");
+    let folder_shown = !app.session.folder_hidden("c0/joints") && !crate::dialogs_mate::showing(app);
     let inactive = app.session.doc.inactive_pattern_occurrences();
     app.session
         .doc

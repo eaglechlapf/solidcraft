@@ -34,10 +34,14 @@ pub static COMMANDS: &[CommandSpec] = &[CommandSpec::new("assembly.mate", "Mate"
          where face: [x,y,z] may be a flat or a cylindrical face and edge: [x,y,z] a straight or round edge (read from the \
          exact geometry); mode?: auto|angle|tangent|axial (auto: two flat faces mate, two cylinders line up on one axis, a \
          straight edge rests on a cylinder; angle: two flat faces at `angle`; tangent: two cylinders side by side; axial: a \
-         straight edge on a cylinder's axis); offset?: the gap (mm or an expression); angle?: deg (for angle); flip?: turn \
+         straight edge on a cylinder's axis); rule?: one of the reply's choices (mate, angle, parallel, tangent, concentric, \
+         insert, line_on_plane, point_on_plane, point_on_cylinder, point_on_axis, coincident) in place of mode, default the \
+         first; offset?: the gap (mm or an expression); angle?: deg (for angle: between the faces' normals or the edges' \
+         or axes' directions; default the angle they are at); reverse?: measure the angle against b's direction reversed \
+         (its supplement; default false for faces, for edges and axes whichever is at most 90 deg now); flip?: turn \
          the moving part over (two faces flush instead of against each other); lock?: true stops the turn of two parts on one \
          axis; limits?: [min, max] of the gap (mm) instead of one gap, or with mode angle of the angle (deg) instead of `angle`: the part moves between them; name?; quiet? → \
-         joint, name, rule, kind, fell_back, dof, conflicts, fixed",
+         joint, name, rule, kind, fell_back, choices, angle?, reverse?, directions?, origins?, lines?, dof, conflicts, fixed",
     )];
 
 /// What a pick is, for choosing the rule.
@@ -84,6 +88,9 @@ struct Try {
     inward: bool,
     tag: Option<Constraint>,
     rule: &'static str,
+    /// An angle between two lines (edges or axes) rather than two faces: a line has no side, so
+    /// the angle measured is the one at most a right angle unless `reverse` says.
+    lines: bool,
 }
 
 fn mate(s: &mut Session, p: &Value) -> Result<Value> {
@@ -100,7 +107,7 @@ fn mate(s: &mut Session, p: &Value) -> Result<Value> {
     let angle = p.get("angle").map(|v| value(s, v, true, cmd)).transpose()?;
     let mode = str_(p, "mode").unwrap_or("auto");
     // An angle's limits are angles (degrees), a gap's lengths.
-    let angular = mode == "angle";
+    let angular = mode == "angle" || str_(p, "rule") == Some("angle");
     let limits = match p.get("limits") {
         None | Some(Value::Null) => None,
         Some(Value::Array(pair)) if pair.len() == 2 => {
@@ -118,10 +125,32 @@ fn mate(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let flip = bool_(p, "flip") == Some(true);
     let lock = bool_(p, "lock") == Some(true);
-    let tries = rules(&moving, &target, mode, flip, lock, cmd)?;
-    if mode == "angle" && angle.is_none() && limits.is_none() {
-        return Err(bad(cmd, "the angle mode needs `angle`"));
+    let choices = choices(moving.shape, target.shape);
+    if choices.is_empty() {
+        return Err(bad(cmd, "these two picks can't be mated"));
     }
+    if mode == "angle" && !choices.contains(&"angle") {
+        return Err(bad(cmd, "the angle mode takes two flat faces"));
+    }
+    if mode == "tangent" && !choices.contains(&"tangent") {
+        return Err(bad(cmd, "the tangent mode takes two cylinders, or a cylinder and a flat face"));
+    }
+    // The rule asked for, or the mode's, or the one the picks suggest (the first that fits).
+    let asked = match str_(p, "rule") {
+        Some(r) => Some(r),
+        None => match mode {
+            "angle" => Some("angle"),
+            "tangent" => Some("tangent"),
+            "axial" if choices.contains(&"concentric") => Some("concentric"),
+            _ => None,
+        },
+    };
+    let rule = match asked {
+        Some(r) if choices.contains(&r) => r,
+        Some(r) => return Err(bad(cmd, format!("`rule` {r} doesn't fit these picks: they take {}", choices.join(", ")))),
+        None => choices.first().copied().unwrap_or("mate"),
+    };
+    let tries = ways(rule, &moving, &target, flip, lock);
     if limits.is_some() && !tries.first().is_some_and(|t| matches!(t.kind, JointKind::Planar | JointKind::Angle)) {
         return Err(bad(cmd, "limits are taken for the gap or the angle between two flat faces"));
     }
@@ -152,6 +181,7 @@ fn mate(s: &mut Session, p: &Value) -> Result<Value> {
             m.insert("rule".into(), json!(t.rule));
             m.insert("kind".into(), serde_json::to_value(t.kind).unwrap_or_default());
             m.insert("fell_back".into(), json!(fell_back));
+            m.insert("choices".into(), json!(choices));
         }
         return Ok(out);
     }
@@ -172,7 +202,10 @@ fn attempt(s: &mut Session, p: &Value, t: &Try, gap: f64, angle: Option<f64>, li
     // An axis has no side: a hole's z is its rim's face normal, whichever rim the pick was nearer.
     // Lined up, or parallel after all, the parts keep the way they face now (else the moving part
     // would turn over, against its other mates), and Flip turns it over from there.
-    let sideless = matches!(t.kind, JointKind::Cylindrical | JointKind::Slider) || (t.kind == JointKind::Parallel && t.rule == "parallel");
+    // Side by side (a line on a cylinder) is the same: turned over, a pin standing by a hole would
+    // turn end for end about the pick and stand up out of it.
+    let sideless = matches!(t.kind, JointKind::Cylindrical | JointKind::Slider | JointKind::LineOnCylinder)
+        || (t.kind == JointKind::Parallel && t.rule == "parallel");
     if sideless {
         let st = s.model.state();
         if let (Some(za), Some(zb)) = (world_z(s, &st, &j.a), world_z(s, &st, &j.b)) {
@@ -184,14 +217,46 @@ fn attempt(s: &mut Session, p: &Value, t: &Try, gap: f64, angle: Option<f64>, li
         }
     }
     let signed = if t.inward { -gap } else { gap };
-    match t.kind {
-        JointKind::Angle => j.angle = angle.unwrap_or(0.0),
-        JointKind::AngleRange => {
-            j.angle = 0.0;
-            if let Some((lo, hi)) = limits {
-                j.limits = vec![None, None, None, None, Some((lo, hi)), None];
+    // An angle is measured between the picks' directions as they are (two faces' normals, two
+    // lines' directions), or with `reverse` against the target's reversed: its supplement.
+    let mut measured: Option<(bool, Option<f64>, JointOrigin, JointOrigin)> = None;
+    let mut tilt_range = None;
+    if matches!(t.kind, JointKind::Angle | JointKind::AngleRange) {
+        let st = s.model.state();
+        let now = match (world_z(s, &st, &j.a), world_z(s, &st, &j.b)) {
+            (Some(a), Some(b)) => a.dot(b).clamp(-1.0, 1.0).acos(),
+            _ => 0.0,
+        };
+        let reverse = bool_(p, "reverse").unwrap_or(t.lines && now > std::f64::consts::FRAC_PI_2);
+        // The joint's tilt for an angle so measured: its frames meet turned over (z against z)
+        // unless flipped (`joints::flip_of`), and a tilt is the same either way round.
+        let datums = |o: &JointOrigin| matches!(o.snap, joints::Snap::Plane { .. } | joints::Snap::Axis { .. });
+        let turned = (datums(&j.a) && datums(&j.b)) == j.flip;
+        let pi = std::f64::consts::PI;
+        let tilt_of = |v: f64| if reverse != turned { pi - v } else { v };
+        // The way the part leans now: the tilt keeps its sign, so the part turns the least.
+        let lean = if tilt_now(s, &j) < 0.0 { -1.0 } else { 1.0 };
+        let shown = if reverse { pi - now } else { now };
+        match t.kind {
+            JointKind::Angle => {
+                let v = angle.unwrap_or(shown);
+                j.angle = lean * tilt_of(v);
+                measured = Some((reverse, Some(v), j.a.clone(), j.b.clone()));
+            }
+            _ => {
+                j.angle = 0.0;
+                if let Some((lo, hi)) = limits {
+                    let (a, b) = (lean * tilt_of(lo), lean * tilt_of(hi));
+                    let range = (a.min(b), a.max(b));
+                    j.limits = vec![None, None, None, None, Some(range), None];
+                    tilt_range = Some(range);
+                }
+                measured = Some((reverse, None, j.a.clone(), j.b.clone()));
             }
         }
+    }
+    match t.kind {
+        JointKind::Angle | JointKind::AngleRange => {}
         // A gap that slides between limits: the parallel joint's z, not a fixed offset.
         JointKind::Parallel if parallel_gap => {
             j.offset = 0.0;
@@ -223,7 +288,7 @@ fn attempt(s: &mut Session, p: &Value, t: &Try, gap: f64, angle: Option<f64>, li
     {
         *z = z.clamp(lo, hi);
     }
-    if let Some((lo, hi)) = limits.filter(|_| t.kind == JointKind::AngleRange)
+    if let Some((lo, hi)) = tilt_range
         && let Some(tilt) = j.values.get_mut(4)
     {
         // A turn is the same a whole turn on: the one nearest the range (a half turn is as much
@@ -245,7 +310,24 @@ fn attempt(s: &mut Session, p: &Value, t: &Try, gap: f64, angle: Option<f64>, li
             m.insert("values".into(), json!(j.values));
         }
     }
-    add_joint(s, j, &q)
+    let mut reply = add_joint(s, j, &q)?;
+    // How an angle is measured, and the two directions it is measured between and a point on each
+    // pick (on its face, edge or axis) where the parts are now: what the view draws its arcs from,
+    // face to face or edge to edge.
+    if let (Some((reverse, v, a, b)), Some(m)) = (measured, reply.as_object_mut()) {
+        let st = s.model.state();
+        m.insert("reverse".into(), json!(reverse));
+        m.insert("lines".into(), json!(t.lines));
+        if let Some(v) = v {
+            m.insert("angle".into(), json!(v.to_degrees()));
+        }
+        if let (Some(fa), Some(fb)) = (world_frame(s, &st, &a), world_frame(s, &st, &b)) {
+            let row = |f: &solidcraft_doc::Mat, i: usize| f.get(i).map_or(json!([0, 0, 0]), |r| json!([r[0], r[1], r[2]]));
+            m.insert("directions".into(), json!({"target": row(&fa, 2), "moving": row(&fb, 2)}));
+            m.insert("origins".into(), json!({"target": row(&fa, 3), "moving": row(&fb, 3)}));
+        }
+    }
+    Ok(reply)
 }
 
 /// A path's direction, start to end, when it runs straight (in any form: an imported part's
@@ -259,16 +341,59 @@ fn straight(path: &[solidcraft_kernel::PathSeg]) -> Option<Vec3> {
     (chord.len() > tol && on).then_some(chord)
 }
 
+/// A joint origin's frame in the world, where its part sits now: z its direction, the last row
+/// where it is.
+fn world_frame(s: &Session, st: &solidcraft_doc::ModelState, o: &JointOrigin) -> Option<solidcraft_doc::Mat> {
+    let frame = joints::resolve_origin(&s.doc, st, o).ok()?;
+    Some(solidcraft_doc::mat_mul(&frame, &joints::occurrence_world(&s.doc, o.occurrence)))
+}
+
 /// The world direction of a joint origin's z, where its part sits now.
 fn world_z(s: &Session, st: &solidcraft_doc::ModelState, o: &JointOrigin) -> Option<Vec3> {
-    let frame = joints::resolve_origin(&s.doc, st, o).ok()?;
-    let world = solidcraft_doc::mat_mul(&frame, &joints::occurrence_world(&s.doc, o.occurrence));
-    let z = world.get(2)?;
+    let z = *world_frame(s, st, o)?.get(2)?;
     Some(Vec3::new(z[0], z[1], z[2]))
 }
 
-/// The ways of mating `moving` to `target`, the one asked for first and the fallback after it.
-fn rules(moving: &Ref, target: &Ref, mode: &str, flip: bool, lock: bool, cmd: &str) -> Result<Vec<Try>> {
+/// The angle two flat faces are at now, as an angle joint `j` between them reads it: what an
+/// angle mate given no angle keeps, so it turns the part no further than lining up the faces.
+fn tilt_now(s: &Session, j: &Joint) -> f64 {
+    let mut range = j.clone();
+    range.kind = JointKind::AngleRange;
+    range.angle = 0.0;
+    joints::relation_values(&s.doc, &s.model.state(), &range).and_then(|v| v.get(4).copied()).filter(|a| a.is_finite()).unwrap_or(0.0)
+}
+
+/// The rules two picks can be joined by, the one they suggest first: what the pill offers.
+fn choices(moving: Shape, target: Shape) -> Vec<&'static str> {
+    use Shape::*;
+    let flat = |s: Shape| matches!(s, Plane | Circle);
+    let round = |s: Shape| matches!(s, Cylinder { .. });
+    match (moving, target) {
+        // Two round edges: one centre on one axis; or only on one axis, or their faces mated.
+        (Circle, Circle) => vec!["insert", "concentric", "mate", "angle", "parallel"],
+        // Two flat faces (a round edge's plane counts as one).
+        (a, b) if flat(a) && flat(b) => vec!["mate", "angle", "parallel"],
+        // A cylinder on a flat face, or its axis in it.
+        (Plane, b) | (b, Plane) if round(b) => vec!["tangent", "line_on_plane"],
+        (Plane, Line) | (Line, Plane) => vec!["line_on_plane"],
+        (Plane, Point) | (Point, Plane) => vec!["point_on_plane"],
+        // Two cylinders: on one axis, side by side, or their axes at an angle.
+        (a, b) if round(a) && round(b) => vec!["concentric", "tangent", "angle", "parallel"],
+        // A straight edge resting on a cylinder, or on its axis, or at an angle to it.
+        (Line, b) | (b, Line) if round(b) => vec!["tangent", "concentric", "angle", "parallel"],
+        // A point on a cylinder's wall, or on its axis.
+        (Point, b) | (b, Point) if round(b) => vec!["point_on_cylinder", "point_on_axis"],
+        // Any two other lines (straight edges, axes): one axis, or at an angle.
+        (a, b) if a.axial() && b.axial() => vec!["concentric", "angle", "parallel"],
+        (Point, b) | (b, Point) if b.axial() => vec!["point_on_axis"],
+        (Point, Point) => vec!["coincident"],
+        _ => Vec::new(),
+    }
+}
+
+/// The ways of mating `moving` to `target` by `rule` (one of [`choices`]), the rule first and the
+/// fallback after it when the parts' other joints won't let it meet.
+fn ways(rule: &str, moving: &Ref, target: &Ref, flip: bool, lock: bool) -> Vec<Try> {
     use Shape::*;
     let (m, t) = (&moving.origin, &target.origin);
     let make = |kind, a: &JointOrigin, b: &JointOrigin, flip, base, inward, tag, rule| Try {
@@ -280,86 +405,83 @@ fn rules(moving: &Ref, target: &Ref, mode: &str, flip: bool, lock: bool, cmd: &s
         inward,
         tag,
         rule,
+        lines: false,
     };
-    let parallel = |flip| make(JointKind::Parallel, t, m, flip, 0.0, false, Some(Constraint::Parallel), "parallel");
-    let axial = || {
+    // A face, or a round edge's face, has a side; an edge or an axis does not.
+    let sided = |s: Shape| matches!(s, Plane | Circle);
+    let parallel = || make(JointKind::Parallel, t, m, flip, 0.0, false, Some(Constraint::Parallel), "parallel");
+    let concentric = || {
         let kind = if lock { JointKind::Slider } else { JointKind::Cylindrical };
-        vec![make(kind, t, m, flip, 0.0, false, Some(Constraint::Concentric), "concentric"), parallel(flip)]
+        make(kind, t, m, flip, 0.0, false, Some(Constraint::Concentric), "concentric")
     };
-    // The side that is the cylinder (or plane, or axis) the other rests on, as side a.
-    let onto = |base: &Ref, other: &Ref| (base.origin.clone(), other.origin.clone());
-    let out = match (moving.shape, target.shape) {
-        // Two flat faces (a round edge's plane counts as one): against each other, flush, or at an angle.
-        (Plane, Plane) | (Plane, Circle) | (Circle, Plane) if mode == "angle" => {
-            vec![make(JointKind::Angle, t, m, flip, 0.0, false, Some(Constraint::Angle), "angle")]
+    // The pick that is the face (or cylinder, or axis) the other rests on, then the other: side a
+    // is the one rested on.
+    let split = |is: &dyn Fn(Shape) -> bool| if is(moving.shape) { (moving, target) } else { (target, moving) };
+    let round = |r: &Ref| match r.shape {
+        Cylinder { radius, hole } => (radius, hole),
+        _ => (0.0, false),
+    };
+    match rule {
+        "mate" => {
+            let (rule, tag) = if flip { ("flush", Constraint::Flush) } else { ("mate", Constraint::Mate) };
+            vec![make(JointKind::Planar, t, m, flip, 0.0, false, Some(tag), rule), parallel()]
         }
-        (Plane, Plane) | (Plane, Circle) | (Circle, Plane) => {
-            let rule = if flip { "flush" } else { "mate" };
-            let tag = if flip { Constraint::Flush } else { Constraint::Mate };
-            vec![make(JointKind::Planar, t, m, flip, 0.0, false, Some(tag), rule), parallel(flip)]
+        "angle" => {
+            let mut way = make(JointKind::Angle, t, m, flip, 0.0, false, Some(Constraint::Angle), "angle");
+            way.lines = !(sided(moving.shape) && sided(target.shape));
+            vec![way]
         }
-        // A cylinder on a flat face.
-        (Plane, Cylinder { .. }) | (Cylinder { .. }, Plane) => {
-            let (plane, round) = if moving.shape == Plane { (moving, target) } else { (target, moving) };
-            let (a, b) = onto(plane, round);
-            let radius = match round.shape {
-                Cylinder { radius, .. } => radius,
-                _ => 0.0,
-            };
-            vec![make(JointKind::LineOnPlane, &a, &b, false, radius, false, Some(Constraint::Tangent), "tangent")]
-        }
-        // A straight edge flat on a face, a point on a face.
-        (Plane, Line) | (Line, Plane) => {
-            let (plane, line) = if moving.shape == Plane { (moving, target) } else { (target, moving) };
-            let (a, b) = onto(plane, line);
-            vec![make(JointKind::LineOnPlane, &a, &b, false, 0.0, false, None, "line_on_plane")]
-        }
-        (Plane, Point) | (Point, Plane) => {
-            let (plane, point) = if moving.shape == Plane { (moving, target) } else { (target, moving) };
-            let (a, b) = onto(plane, point);
-            vec![make(JointKind::PointOnPlane, &a, &b, false, 0.0, false, Some(Constraint::Distance), "point_on_plane")]
-        }
-        // Two cylinders: on one axis, or side by side.
-        (Cylinder { radius: ra, hole: ha }, Cylinder { radius: rb, hole: hb }) if mode == "tangent" => {
-            // One inside the other (a shaft in a hole) touches inside: the radii's difference.
-            let (base, inward) = if ha != hb { ((ra - rb).abs(), true) } else { (ra + rb, false) };
-            vec![make(JointKind::LineOnCylinder, t, m, false, base, inward, None, "tangent")]
-        }
-        // A straight edge on a cylinder: resting on it, or on its axis.
-        (Line, Cylinder { radius, hole }) | (Cylinder { radius, hole }, Line) if mode != "axial" => {
-            let (round, line) = if moving.shape == Line { (target, moving) } else { (moving, target) };
-            let (a, b) = onto(round, line);
-            vec![make(JointKind::LineOnCylinder, &a, &b, false, radius, hole, None, "tangent")]
-        }
-        // A point on a cylinder's wall.
-        (Point, Cylinder { radius, hole }) | (Cylinder { radius, hole }, Point) => {
-            let (round, point) = if moving.shape == Point { (target, moving) } else { (moving, target) };
-            let (a, b) = onto(round, point);
-            vec![make(JointKind::PointOnCylinder, &a, &b, false, radius, hole, None, "point_on_cylinder")]
-        }
-        // Two round edges: one centre on one axis, turning (or locked).
-        (Circle, Circle) => {
+        "parallel" => vec![parallel()],
+        "concentric" => vec![concentric(), parallel()],
+        "insert" => {
             let kind = if lock { JointKind::Rigid } else { JointKind::Revolute };
-            let mut out = vec![make(kind, t, m, flip, 0.0, false, Some(Constraint::Insert), "insert")];
-            out.extend(axial());
-            out
+            vec![make(kind, t, m, flip, 0.0, false, Some(Constraint::Insert), "insert"), concentric(), parallel()]
         }
-        // Any two other lines: one axis.
-        (a, b) if a.axial() && b.axial() => axial(),
-        // A point on an axis.
-        (Point, b) if b.axial() => vec![make(JointKind::PointOnLine, t, m, false, 0.0, false, Some(Constraint::PointOnAxis), "point_on_axis")],
-        (a, Point) if a.axial() => vec![make(JointKind::PointOnLine, m, t, false, 0.0, false, Some(Constraint::PointOnAxis), "point_on_axis")],
+        "tangent" => match (moving.shape, target.shape) {
+            // One inside the other (a shaft in a hole) touches inside: the radii's difference.
+            (Cylinder { radius: ra, hole: ha }, Cylinder { radius: rb, hole: hb }) => {
+                let (base, inward) = if ha != hb { ((ra - rb).abs(), true) } else { (ra + rb, false) };
+                vec![make(JointKind::LineOnCylinder, t, m, false, base, inward, None, "tangent")]
+            }
+            (Plane, _) | (_, Plane) => {
+                let (plane, cylinder) = split(&|s| s == Plane);
+                vec![make(
+                    JointKind::LineOnPlane,
+                    &plane.origin,
+                    &cylinder.origin,
+                    false,
+                    round(cylinder).0,
+                    false,
+                    Some(Constraint::Tangent),
+                    "tangent",
+                )]
+            }
+            _ => {
+                let (cylinder, line) = split(&|s| matches!(s, Cylinder { .. }));
+                let (radius, hole) = round(cylinder);
+                vec![make(JointKind::LineOnCylinder, &cylinder.origin, &line.origin, false, radius, hole, None, "tangent")]
+            }
+        },
+        "line_on_plane" => {
+            let (plane, line) = split(&|s| s == Plane);
+            vec![make(JointKind::LineOnPlane, &plane.origin, &line.origin, false, 0.0, false, None, "line_on_plane")]
+        }
+        "point_on_plane" => {
+            let (plane, point) = split(&|s| s == Plane);
+            vec![make(JointKind::PointOnPlane, &plane.origin, &point.origin, false, 0.0, false, Some(Constraint::Distance), "point_on_plane")]
+        }
+        "point_on_cylinder" => {
+            let (cylinder, point) = split(&|s| matches!(s, Cylinder { .. }));
+            let (radius, hole) = round(cylinder);
+            vec![make(JointKind::PointOnCylinder, &cylinder.origin, &point.origin, false, radius, hole, None, "point_on_cylinder")]
+        }
+        "point_on_axis" => {
+            let (axis, point) = split(&|s| s != Point);
+            vec![make(JointKind::PointOnLine, &axis.origin, &point.origin, false, 0.0, false, Some(Constraint::PointOnAxis), "point_on_axis")]
+        }
         // Two points: on one spot, turning any way.
-        (Point, Point) => vec![make(JointKind::Ball, t, m, false, 0.0, false, None, "coincident")],
-        _ => return Err(bad(cmd, "these two picks can't be mated")),
-    };
-    if mode == "angle" && !out.first().is_some_and(|t| t.kind == JointKind::Angle) {
-        return Err(bad(cmd, "the angle mode takes two flat faces"));
+        _ => vec![make(JointKind::Ball, t, m, false, 0.0, false, None, "coincident")],
     }
-    if mode == "tangent" && !out.first().is_some_and(|t| matches!(t.kind, JointKind::LineOnCylinder | JointKind::LineOnPlane)) {
-        return Err(bad(cmd, "the tangent mode takes two cylinders, or a cylinder and a flat face"));
-    }
-    Ok(out)
 }
 
 /// A pick and what it is, from the exact geometry under it.

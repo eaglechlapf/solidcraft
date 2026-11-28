@@ -3944,9 +3944,11 @@ impl SolveApp {
     /// picks a plane ([`SolveApp::picking_plane`]) the Origin is always shown, drawn through the
     /// model (a plane inside a body stays visible), even when the browser hides it — except the
     /// origin planes for Project ([`SolveApp::picking_project_geometry`], #10778), which keep a
-    /// hidden Origin hidden.
+    /// hidden Origin hidden. While the Mate tool shows a mate the Origin is not drawn: its pill and
+    /// arcs say what the mate is, and planes and axes across them would make those hard to read
+    /// (the next pick is a part to move, never the design's origin).
     pub fn origin_visible(&self) -> bool {
-        self.origin_shown() || self.picking_plane()
+        !crate::dialogs_mate::showing(self) && (self.origin_shown() || self.picking_plane())
     }
 
     /// Is Create Sketch open, waiting for its plane?

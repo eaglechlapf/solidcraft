@@ -825,6 +825,56 @@ impl MateMode {
     }
 }
 
+/// The rule `assembly.mate` joins its two picks by, of those they take.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MateRule {
+    /// Two flat faces against each other (flush with `flip`).
+    Mate,
+    /// Two flat faces at `angle`.
+    Angle,
+    /// Two flat faces, or two axes, parallel at whatever distance they are.
+    Parallel,
+    /// Two cylinders side by side, a cylinder on a flat face, or a straight edge on a cylinder.
+    Tangent,
+    /// Two axes on one line.
+    Concentric,
+    /// Two round edges on one centre and one axis.
+    Insert,
+    /// A straight edge, or a cylinder's axis, in a flat face.
+    LineOnPlane,
+    /// A point on a flat face.
+    PointOnPlane,
+    /// A point on a cylinder's wall.
+    PointOnCylinder,
+    /// A point on an axis.
+    PointOnAxis,
+    /// Two points on one spot.
+    Coincident,
+}
+
+impl MateRule {
+    const NAMES: &'static [&'static str] = &[
+        "mate",
+        "angle",
+        "parallel",
+        "tangent",
+        "concentric",
+        "insert",
+        "line_on_plane",
+        "point_on_plane",
+        "point_on_cylinder",
+        "point_on_axis",
+        "coincident",
+    ];
+
+    fn read(v: &Value) -> Result<Self, String> {
+        let bad = || format!("`rule` must be one of {}", Self::NAMES.join(", "));
+        let name = v.as_str().filter(|n| Self::NAMES.contains(n)).ok_or_else(bad)?;
+        serde_json::from_value(Value::String(name.into())).map_err(|_| bad())
+    }
+}
+
 /// The lowest and highest gap: two lengths in mm, or expressions.
 #[derive(Debug)]
 pub struct MateLimits(pub Vec<Value>);
@@ -869,14 +919,26 @@ pub struct MateParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "MateMode")]
     pub mode: Option<MateMode>,
+    /// The rule to join them by, one the picks take (the reply's `choices`); it takes the place
+    /// of `mode`. Default: the one the picks suggest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "MateRule")]
+    pub rule: Option<MateRule>,
     /// The gap, in mm or an expression. Default: 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "JointValue")]
     pub offset: Option<JointValue>,
-    /// The angle mode's angle, in degrees or an expression.
+    /// The angle rule's angle, in degrees or an expression: between the two faces' normals, or the
+    /// two edges' or axes' directions (see `reverse`). Default: the angle they are at now (the
+    /// reply's `angle`), so the part only turns as far as the rule needs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "JointValue")]
     pub angle: Option<JointValue>,
+    /// Measure the angle (and its limits) against the target's direction reversed: the supplement
+    /// of the angle between the directions. Default: false for two faces; for two edges or axes,
+    /// whichever makes the angle they are at now no more than a right angle.
+    #[serde(default)]
+    pub reverse: Option<bool>,
     /// Turn the moving part over: two flat faces flush instead of against each other. Default: false.
     #[serde(default)]
     pub flip: Option<bool>,
@@ -909,8 +971,10 @@ impl<'de> Deserialize<'de> for MateParams {
             a: given(&m, "a", JointOriginArg::read)?,
             b: given(&m, "b", JointOriginArg::read)?,
             mode: given(&m, "mode", MateMode::read)?,
+            rule: given(&m, "rule", MateRule::read)?,
             offset: given(&m, "offset", JointValue::read)?,
             angle: given(&m, "angle", JointValue::read)?,
+            reverse: flag(&m, "reverse")?,
             flip: flag(&m, "flip")?,
             lock: flag(&m, "lock")?,
             limits: given(&m, "limits", MateLimits::read)?,
@@ -932,6 +996,33 @@ pub struct MateResult {
     pub kind: String,
     /// True when the alignment asked for could not be met and the parts were made parallel.
     pub fell_back: bool,
+    /// The rules the two picks take, the one they suggest first: what `rule` may ask for.
+    pub choices: Vec<String>,
+    /// An angle rule's angle, in degrees, as `reverse` measures it: the one asked for, or the one
+    /// the parts were at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub angle: Option<f64>,
+    /// An angle rule: whether it is measured against the target's direction reversed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reverse: Option<bool>,
+    /// An angle rule: the two directions it is measured between, where the parts are now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directions: Option<MateDirections>,
+    /// An angle rule: a point on each pick (on its face, edge or axis), where the parts are now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origins: Option<MateDirections>,
+    /// An angle rule: between two lines (edges or axes) rather than two faces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines: Option<bool>,
+}
+
+/// A pair of world vectors, the target pick's and the moving part's: the directions an angle is
+/// measured between (unit length: a face normal, an edge's or an axis's direction), or a point on
+/// each pick.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct MateDirections {
+    pub target: [f64; 3],
+    pub moving: [f64; 3],
 }
 
 /// Change a constraint (a joint made with `assembly.constraint.create`) in place: its rule, gap,
