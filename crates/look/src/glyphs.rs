@@ -59,7 +59,7 @@ pub fn paint_glyph(ui: &Ui, c: Caption, maximized: bool, at: egui::Pos2, s: Stro
     }
 }
 
-/// [`Glyphs::badge`]: the `lock` or `pin` status badge in `r`.
+/// [`Glyphs::badge`]: the `lock`, `pin` or `dof1`…`dof6` status badge in `r`.
 pub fn badge(p: &egui::Painter, r: Rect, name: &str, c: Color32) {
     let s = Stroke::new(1.3, c);
     match name {
@@ -83,6 +83,22 @@ pub fn badge(p: &egui::Painter, r: Rect, name: &str, c: Color32) {
             let head = pos2(r.center().x + 2.0, r.top() + 4.0);
             p.circle_filled(head, 3.2, c);
             p.line_segment([head, pos2(r.left() + 1.5, r.bottom() - 1.0)], Stroke::new(1.6, c));
+        }
+        // Degrees of freedom left: the count, on the disc the row draws under it, centred on the
+        // digit's ink (its line box has room for ascenders and descenders, which sits it off-centre).
+        _ if name.starts_with("dof") => {
+            let count = name.trim_start_matches("dof").to_owned();
+            let galley = p.layout_no_wrap(count, egui::FontId::proportional(r.height() * 0.8), c);
+            let ink = galley.rows.first().and_then(|row| {
+                let first = row.row.glyphs.first()?;
+                let last = row.row.glyphs.last()?;
+                let top = row.pos.y + first.pos.y + first.uv_rect.offset.y;
+                let left = row.pos.x + first.pos.x + first.uv_rect.offset.x;
+                let right = row.pos.x + last.pos.x + last.uv_rect.offset.x + last.uv_rect.size.x;
+                Some(Rect::from_min_max(pos2(left, top), pos2(right, top + first.uv_rect.size.y)))
+            });
+            let ink = ink.filter(|i| i.is_positive()).unwrap_or(Rect::from_min_size(pos2(0.0, 0.0), galley.size()));
+            p.galley(r.center() - ink.center().to_vec2(), galley, c);
         }
         _ => {}
     }

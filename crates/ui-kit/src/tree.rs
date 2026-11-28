@@ -23,6 +23,28 @@ const BADGE_RING_SIDES: usize = 16;
 const DRAG_EDGE: f32 = 24.0;
 const DRAG_SCROLL: f32 = 6.0;
 
+/// Text ink for a solid badge fill: whichever of the theme's own on-fill colours reads best on it,
+/// or black or white where none of them reads as text (4.5:1), as a tab pill's ink does
+/// ([`solidcraft_theme::TabAccent::on_fill`]): a mid-tone amber has no theme ink dark enough.
+pub fn badge_ink(fill: Color32) -> Color32 {
+    badge_ink_in(&Tokens::get(), fill)
+}
+
+/// [`badge_ink`] in theme `t`.
+pub fn badge_ink_in(t: &Tokens, fill: Color32) -> Color32 {
+    use solidcraft_theme::contrast_ratio;
+    let best = [t.on_accent, t.tab_on_fill_dark, t.form_ink]
+        .into_iter()
+        .fold(t.text, |best, ink| if contrast_ratio(ink, fill) > contrast_ratio(best, fill) { ink } else { best });
+    if contrast_ratio(best, fill) >= 4.5 {
+        best
+    } else if contrast_ratio(Color32::BLACK, fill) >= contrast_ratio(Color32::WHITE, fill) {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    }
+}
+
 /// Trailing tree action; disabled actions retain their reason and a scenario rectangle.
 pub struct TreeAction<'a> {
     pub icon: &'a str,
@@ -82,7 +104,7 @@ pub struct Row<'a> {
     pub tip: Option<&'a str>,
     /// Component rows: is it the active one?
     pub radio: Option<bool>,
-    /// Trailing badges: "lock", "pin".
+    /// Trailing badges: "lock", "pin", or "dof1" to "dof6" (degrees of freedom left).
     pub badges: &'a [&'a str],
     /// A button right after the name: (icon, tooltip label), e.g. a feature's profile sketch.
     pub action: Option<(&'a str, &'a str)>,
@@ -497,7 +519,15 @@ pub fn tree_row(ui: &mut egui::Ui, id: egui::Id, row: &Row) -> RowResp {
     let mut bx = (x + lw + 6.0 + name_action_width).min(if eye_end && row.eye.is_some() { end } else { r.right() } - 16.0);
     for b in row.badges {
         let br = Rect::from_center_size(pos2(bx + 6.0, cy), vec2(t.space_12, t.space_12));
-        badge(ui.painter(), br, b, t.text_dim);
+        // A part still free to move stands out: its count on an amber disc, in the ink that reads
+        // best on the disc in this theme (amber alone is too faint on light panels).
+        let ink = if b.starts_with("dof") {
+            ui.painter().circle_filled(br.center(), br.width().min(br.height()) * 0.5 + 0.5, t.warning);
+            badge_ink(t.warning)
+        } else {
+            t.text_dim
+        };
+        badge(ui.painter(), br, b, ink);
         solidcraft_ui_registry::publish_rect(&format!("row_badge:{b}:{handle}"), br);
         bx += 15.0;
     }

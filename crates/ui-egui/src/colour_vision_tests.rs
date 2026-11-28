@@ -1382,3 +1382,26 @@ fn the_curvature_scale_lightens_steadily_for_every_eye() {
         }
     }
 }
+
+/// A placement the joints still leave free shows its degrees of freedom on an amber disc in the
+/// Browser. Amber alone is too faint on light panels (2.4:1 in the default light theme, 1.7:1 in
+/// SolidCraft 95), so the count is written on the disc in the ink that reads best on it: readable
+/// as text in every shipped theme and colour vision mode.
+#[test]
+fn the_free_placement_count_reads_on_its_disc_in_every_theme() {
+    crate::test_support::host_data();
+    use crate::theme_files::{builtin, resolve};
+    use solidcraft_theme::contrast_ratio;
+    let modes = [false, true].into_iter().flat_map(|dark| {
+        std::iter::once(ColorVision::Off).chain(MODES).map(move |mode| (format!("{mode:?} dark={dark}"), Tokens::themed(dark, mode)))
+    });
+    let themes = modes.chain(builtin().iter().map(|f| (f.id.clone(), resolve(f))));
+    let mut failures = Vec::new();
+    for (id, t) in themes {
+        let c = contrast_ratio(crate::ui_kit::badge_ink_in(&t, t.warning), t.warning);
+        if c < 4.5 {
+            failures.push(format!("{id}: count on {:?}: contrast {c:.2}", t.warning));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

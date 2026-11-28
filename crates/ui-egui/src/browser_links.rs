@@ -3,12 +3,11 @@
 //! window: when the design's links change, and when the window comes back to the front.
 
 use crate::SolveApp;
-use crate::ui_kit::IconBadge;
-use egui::Color32;
+use crate::ui_kit::{IconBadge, badge_ink};
 use serde_json::{Value, json};
 use solidcraft_engine::Session;
 use solidcraft_engine::doc::DesignLink;
-use solidcraft_theme::{Tokens, contrast_ratio};
+use solidcraft_theme::Tokens;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
@@ -43,20 +42,12 @@ impl LinkState {
         let t = Tokens::get();
         let (fill, ink, outlined) = match self {
             LinkState::Linked => (t.selected_bg, t.accent, false),
-            LinkState::Changed => (t.warning, ink_on(t.warning), false),
-            LinkState::Missing => (t.error, ink_on(t.error), false),
+            LinkState::Changed => (t.warning, badge_ink(t.warning), false),
+            LinkState::Missing => (t.error, badge_ink(t.error), false),
             LinkState::Unchecked => (t.panel, t.text_dim, true),
         };
         IconBadge { glyph: self.glyph(), fill, ink, outlined }
     }
-}
-
-/// Text ink for a solid badge fill: whichever of the theme's own on-fill colours reads best on it.
-fn ink_on(fill: Color32) -> Color32 {
-    let t = Tokens::get();
-    [t.on_accent, t.tab_on_fill_dark, t.form_ink]
-        .into_iter()
-        .fold(t.text, |best, ink| if contrast_ratio(ink, fill) > contrast_ratio(best, fill) { ink } else { best })
 }
 
 /// The row of one linked component: its badge, and what hovering it says.

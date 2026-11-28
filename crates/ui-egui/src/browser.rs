@@ -2178,7 +2178,10 @@ fn occurrence_rows_inner(
     // A cut component has a dashed outline until Paste moves it.
     let cut = app.cut.placements.iter().any(|p| p.as_slice() == path);
     let link = app.tree.links.get(placement.component).cloned();
-    let badges: &[&str] = if placement.grounded { &["pin"] } else { &[] };
+    // A placement the joints still leave free shows how many degrees of freedom it has left.
+    static FREE: [&str; 7] = ["", "dof1", "dof2", "dof3", "dof4", "dof5", "dof6"];
+    let badges: &[&str] =
+        if placement.grounded { &["pin"] } else { FREE.get(placement.free).filter(|b| !b.is_empty()).map_or(&[], std::slice::from_ref) };
     let emphasis = app.tree.search.hits().filter(|_| matches).and_then(|h| h.span(&placement.label));
     app.tree.remember(key);
     let appearance = if crate::render_workspace::active(app) {

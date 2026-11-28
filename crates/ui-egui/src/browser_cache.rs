@@ -19,6 +19,8 @@ pub(super) struct Node {
     pub key: String,
     pub tooltip: String,
     pub grounded: bool,
+    /// Degrees of freedom the joints leave it (0: placed for good, or not marked).
+    pub free: usize,
     pub first: bool,
     pub children: Vec<Vec<u64>>,
     pub hover_bodies: Option<Vec<String>>,
@@ -111,6 +113,44 @@ pub(super) struct Cache {
     pub occurrences: HashMap<Vec<u64>, Node>,
     /// What each component's row says about the parts of it its import could not bring in.
     pub defects: BTreeMap<u64, crate::ui_kit::StatusTip>,
+    /// How free each placement is, and the joints and grounding it was worked out from.
+    freedom: Option<(FreedomKey, BTreeMap<u64, usize>)>,
+}
+
+/// What a placement's freedom depends on: the joints and motion links between the parts and which
+/// parts are grounded, not where the parts are (a drag moves them every frame).
+#[derive(PartialEq)]
+struct FreedomKey {
+    joints: Vec<(u64, solidcraft_engine::doc::joints::JointKind, u64, u64, bool)>,
+    links: Vec<solidcraft_engine::doc::joints::MotionLink>,
+    occurrences: Vec<(u64, u64, bool)>,
+}
+
+impl FreedomKey {
+    fn of(doc: &Document) -> Self {
+        Self {
+            joints: doc.assembly.joints.iter().map(|j| (j.id, j.kind, j.a.occurrence, j.b.occurrence, j.suppressed)).collect(),
+            links: doc.assembly.links.clone(),
+            occurrences: doc.occurrences.iter().map(|o| (o.id, o.parent, o.grounded)).collect(),
+        }
+    }
+}
+
+/// The placements to mark as still free, with their degrees of freedom: once the design has a
+/// joint or a grounded part, each top-level placement the joints leave free, and each part inside a
+/// subassembly that a joint names (one no joint names moves with its subassembly).
+fn free_placements(doc: &Document, state: &ModelState) -> BTreeMap<u64, usize> {
+    use solidcraft_engine::doc::joints;
+    if doc.assembly.joints.is_empty() && !doc.occurrences.iter().any(|o| o.grounded) {
+        return BTreeMap::new();
+    }
+    let sol = joints::solve_holding_with_analysis(doc, state, &joints::Held::new(), joints::Analysis::DegreesOfFreedom);
+    let named = |id: u64| doc.assembly.joints.iter().any(|j| j.a.occurrence == id || j.b.occurrence == id);
+    doc.occurrences
+        .iter()
+        .filter(|o| !o.grounded && (o.parent == 0 || named(o.id)))
+        .filter_map(|o| sol.dof.get(&o.id).filter(|d| **d > 0).map(|d| (o.id, (*d).min(6))))
+        .collect()
 }
 
 impl Cache {
@@ -152,6 +192,10 @@ impl Cache {
         self.scheduled = self.root.children.len();
         self.root_bodies = crate::context_menu::component_bodies(app, 0);
         self.defects = crate::browser_defects::component_tips(&app.session.doc, &app.session.model);
+        let key = FreedomKey::of(&app.session.doc);
+        if self.freedom.as_ref().is_none_or(|(k, _)| *k != key) {
+            self.freedom = Some((key, free_placements(&app.session.doc, &state)));
+        }
         // Weak snapshot identities catch replacement and reevaluation without retaining a
         // closed design's geometry while the browser is collapsed.
         self.doc = Arc::downgrade(&app.session.doc);
@@ -201,6 +245,15 @@ impl Cache {
             tooltip.push_str(&doc.occurrences.get(*self.ids.get(id)?)?.name);
         }
         tooltip.push_str("\nGeometry edits apply to every instance of this component.");
+        let free = self.freedom.as_ref().and_then(|(_, f)| f.get(&occurrence.id)).copied().unwrap_or(0);
+        if free > 0 {
+            tooltip.push('\n');
+            tooltip.push_str(&if free == 1 {
+                solidcraft_ui_text::format("constrain.dof_one", &[("part", &occurrence.name)])
+            } else {
+                solidcraft_ui_text::format("constrain.dof", &[("part", &occurrence.name), ("count", &free.to_string())])
+            });
+        }
         let children = self.children(app, component, path, solidcraft_engine::doc::MAX_PLACEMENTS.saturating_sub(self.scheduled));
         self.scheduled += children.len();
         Some((
@@ -213,6 +266,7 @@ impl Cache {
                 key: occurrence_key(path),
                 tooltip,
                 grounded: occurrence.grounded,
+                free,
                 first,
                 children,
                 hover_bodies: None,
